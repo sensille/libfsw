@@ -1,8 +1,7 @@
 use object::{Object, ObjectSection};
 use gimli::{ UnwindSection, Register };
 use thiserror::Error;
-use std::collections::HashMap;
-use std::collections::BTreeMap;
+use std::collections::{ HashMap, BTreeMap, BTreeSet };
 
 #[derive(Error, Debug)]
 pub enum FswError {
@@ -63,12 +62,13 @@ struct EvaluationContext {
 
 #[derive(Debug)]
 pub struct Fsw {
-    unwind_table: BTreeMap<u64, Option<usize>>,
+    unwind_table: BTreeMap<(usize, u64), Option<usize>>,
     unwind_entries: BTreeMap<usize, UnwindEntry>,
     unwind_entries_rev: BTreeMap<UnwindEntry, usize>,
     maps: BTreeMap<u64, EvaluationContext>, // XXX
     expressions: BTreeMap<usize, Vec<u8>>,
     expressions_rev: BTreeMap<Vec<u8>, usize>,
+    parsing_errors: HashMap<ParsingError, u64>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -88,10 +88,14 @@ impl Fsw {
             maps: BTreeMap::new(),
             expressions: BTreeMap::new(),
             expressions_rev: BTreeMap::new(),
+            parsing_errors: HashMap::new(),
         }
     }
 
-    pub fn add_file<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
+    // oid object id must be unique
+    pub fn add_file<P: AsRef<std::path::Path>>(&mut self, path: P, oid: usize)
+        -> Result<()>
+    {
         let file = std::fs::File::open(path).map_err(FileOpenError)?;
 
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(MmapError)? };
@@ -108,11 +112,9 @@ impl Fsw {
         let mut entries = eh_frame.entries(&bases);
         let mut cies = HashMap::new();
         let mut unwind_ctx = gimli::UnwindContext::new();
-        let mut errors: HashMap<ParsingError, u64> = HashMap::new();
         while let Some(entry) = entries.next().map_err(GimliError)? {
             match entry {
                 gimli::CieOrFde::Cie(cie) => {
-                    println!("Found CIE: offset {:x}", cie.offset());
                     cies.insert(cie.offset(), cie);
                 }
                 gimli::CieOrFde::Fde(partial_fde) => {
@@ -198,25 +200,43 @@ impl Fsw {
                         // start may override end
                         // start may not override start
                         // end overrides nothing
-                        if let Some(Some(_)) = self.unwind_table.get(&row.start_address()) {
+                        let start = row.start_address();
+                        let end = row.end_address();
+                        if let Some(Some(_)) = self.unwind_table.get(&(oid, start)) {
                             error = ParsingError::RowOverlap;
                             break 'rows;
                         }
-                        self.unwind_table.insert(row.start_address(), Some(entryid));
-                        if self.unwind_table.get(&row.end_address()).is_none() {
-                            self.unwind_table.insert(row.end_address(), None);
+                        self.unwind_table.insert((oid, start), Some(entryid));
+                        if self.unwind_table.get(&(oid, end)).is_none() {
+                            self.unwind_table.insert((oid, end), None);
                         }
                     }
                     if error != ParsingError::NoError {
-                        *errors.entry(error).or_default() += 1;
+                        *self.parsing_errors.entry(error).or_default() += 1;
                     }
                 }
             }
         }
-        println!("Parsing errors: {:?}", errors);
+        println!("Parsing errors: {:?}", self.parsing_errors);
         println!("Unwind entries: {}", self.unwind_entries.len());
         println!("Unwind table  : {}", self.unwind_table.len());
         println!("Expressions   : {}", self.expressions.len());
+        Ok(())
+    }
+
+    pub fn add_pid(&mut self, pid: u32) -> Result<()> {
+        let maps = read_process_maps(pid)?;
+        let mut seen = BTreeSet::new();
+        for map in maps {
+            if seen.contains(&map.file_path) {
+                continue;
+            }
+            let oid = seen.len();
+            seen.insert(map.file_path.clone());
+            let res = self.add_file(&map.file_path, oid);
+println!("Adding file: {} result {:?}", map.file_path, res);
+        }
+
         Ok(())
     }
 
@@ -231,6 +251,58 @@ println!("expression: {:?}", expr);
             id
         }
     }
+
+    fn build_table(&mut self) {
+        // table format:
+        // header: u64 start address
+        // body: all varints
+        //    (1) varint delta to base,
+        //    (2) varint offset to left
+        //    (3) varint offset to right
+        //    (4) varint entry id
+        //
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessMap {
+    pub vm_start: u64,
+    pub vm_end: u64,
+    pub offset: u64,
+    pub file_path: String,
+}
+
+pub fn read_process_maps(pid: u32) -> Result<Vec<ProcessMap>> {
+    let path = format!("/proc/{}/maps", pid);
+    let content = std::fs::read_to_string(path).map_err(FileOpenError)?;
+    let mut maps = Vec::new();
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_ascii_whitespace().collect();
+        if parts.len() < 6 {  // ignore all lines without file path
+            continue;
+        }
+        if !parts[5].starts_with("/") {  // ignore anon mappings
+            continue;
+        }
+        if parts[5].ends_with(" (deleted)") {  // ignore deleted files
+            continue;
+        }
+        let addrs: Vec<&str> = parts[0].split('-').collect();
+        if addrs.len() != 2 {
+            continue;
+        }
+        let vm_start = u64::from_str_radix(addrs[0], 16).unwrap_or(0);
+        let vm_end = u64::from_str_radix(addrs[1], 16).unwrap_or(0);
+        let offset = u64::from_str_radix(parts[2], 16).unwrap_or(0);
+        let file_path = parts[5].to_string();
+        maps.push(ProcessMap {
+            vm_start,
+            vm_end,
+            offset,
+            file_path,
+        });
+    }
+    Ok(maps)
 }
 
 #[cfg(test)]
