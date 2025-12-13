@@ -3,8 +3,9 @@ use libfsw::Fsw;
 
 
 fn main() -> Result<()> {
-    let fsw = Fsw::new();
+    let mut fsw = Fsw::new();
     fsw.add_file("/usr/lib/firefox/firefox")?;
+    fsw.add_file("../fswutil/ceph-osd")?;
 
     Ok(())
 }
