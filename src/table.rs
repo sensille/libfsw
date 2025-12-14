@@ -19,7 +19,11 @@ struct BuildCtx {
     bytes_in_right_ptr: usize,
     both_pointers_empty: usize,
     bytes_in_keys: usize,
-    key_size_hist: [usize; 65],
+    key_size_hist_pos: [usize; 65],
+    key_size_hist_neg: [usize; 65],
+    encoded_keys_len_1: usize,
+    encoded_keys_len_3: usize,
+    encoded_keys_len_9: usize,
 }
 
 pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
@@ -40,7 +44,11 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         bytes_in_right_ptr: 0,
         both_pointers_empty: 0,
         bytes_in_keys: 0,
-        key_size_hist: [0; 65],
+        key_size_hist_pos: [0; 65],
+        key_size_hist_neg: [0; 65],
+        encoded_keys_len_1: 0,
+        encoded_keys_len_3: 0,
+        encoded_keys_len_9: 0,
     };
     build_recurse(&mut ctx, arr, 0)?;
 
@@ -52,7 +60,10 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     println!("  bytes in right ptrs: {}", ctx.bytes_in_right_ptr);
     println!("    empty right ptrs: {}", ctx.empty_right_pointers);
     println!("  nodes with both ptrs empty: {}", ctx.both_pointers_empty);
-    println!("  key size histogram: {:?}", ctx.key_size_hist);
+    println!("  key size histogram pos: {:?}", ctx.key_size_hist_pos);
+    println!("  key size histogram neg: {:?}", ctx.key_size_hist_neg);
+    println!("  encoded keys length counts: len 1: {}, len 3: {}, len 9: {}",
+        ctx.encoded_keys_len_1, ctx.encoded_keys_len_3, ctx.encoded_keys_len_9);
 
     ctx.buf.reverse();
 
@@ -62,6 +73,7 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Value {
     EmptyPtr,
+    BothPtrEmpty,
     RelKey(i64),
     RelPtr(u64),
     Val(u64),
@@ -73,12 +85,14 @@ pub(crate) enum Value {
 //   00-EF: encode as 1 byte
 //   F0-F7: first byte with 3 lower bits of value, followd by 2 bytes (little-endian)
 //   f8   : EmptyPtr
+//   f9   : BothPtrEmpty
 // values:
 //   00-F7: encode as 1 byte
 //   F8-FF: first byte with 3 lower bits of value, followd by 2 bytes (little-endian)
 // RelKey:
-//   -127 to 127: 1 bytes directly. val + 120
-//   FF: followed by 8 bytes i64 (little-endian)
+//   00-DE: 1 byte, val + 111
+//   DF   : followed by 8 bytes i64 (little-endian)
+//   E0-FF: lower 5 bits, followed by 2 bytes (little-endian)
 //
 // Maximum encodable table size is 256k
 //
@@ -86,8 +100,16 @@ impl Value {
     pub fn as_bytes(&self) -> Result<Vec<u8>> {
         Ok(match self {
             Value::RelKey(v) => {
-                if *v >= -127 && *v <= 127 {
-                    Vec::from([(*v as i8 + 120) as u8])
+                if *v >= -111 && *v <= 111 {
+                    Vec::from([(*v as i8 + 111) as u8])
+                } else if *v >= -0x1f_ffff && *v <= 0x1f_ffff {
+                    let mut b = Vec::with_capacity(3);
+                    let v_u = *v as u64;
+                    let b0 = 0xe0 | ((v_u as u8) & 0x1f);
+                    b.push(b0);
+                    b.push((v_u & 0xff) as u8);
+                    b.push(((v_u >> 8) & 0xff) as u8);
+                    b
                 } else {
                     let mut b = Vec::with_capacity(9);
                     b.push(0xff);
@@ -109,6 +131,7 @@ println!("Value too large to encode: {:?}", self);
                 }
             }
             Value::EmptyPtr => Vec::from([0xf8]),
+            Value::BothPtrEmpty => Vec::from([0xf9]),
         })
     }
     pub fn read_rel_ptr(b: &[u8]) -> Result<(Value, usize)> {
@@ -199,33 +222,38 @@ fn build_recurse(
     // we build from back to front, so push in reverse order
     let n = push_number(&mut ctx.buf, Value::Val(own_value))?;
     ctx.bytes_in_values += n;
-    if right_ptr == 0 {
-        push_number(&mut ctx.buf, Value::EmptyPtr)?;
-        ctx.empty_left_pointers += 1;
-    } else {
-        let pos = ctx.buf.len() as u64;
-        let n = push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?;
-        ctx.bytes_in_left_ptr += n;
-    }
-    if left_ptr == 0 {
-        push_number(&mut ctx.buf, Value::EmptyPtr)?;
-        ctx.empty_right_pointers += 1;
-    } else {
-        let pos = ctx.buf.len() as u64;
-        let n = push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?;
-        ctx.bytes_in_right_ptr += n;
-    }
     if left_ptr == 0 && right_ptr == 0 {
         ctx.both_pointers_empty += 1;
+        push_number(&mut ctx.buf, Value::BothPtrEmpty)?;
+    } else {
+        if right_ptr == 0 {
+            push_number(&mut ctx.buf, Value::EmptyPtr)?;
+            ctx.empty_right_pointers += 1;
+            ctx.bytes_in_right_ptr += 1;
+        } else {
+            let pos = ctx.buf.len() as u64;
+            let n = push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?;
+            ctx.bytes_in_right_ptr += n;
+        }
+        assert!(left_ptr != 0);
+        let pos = ctx.buf.len() as u64;
+        let n = push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?;
+        ctx.bytes_in_left_ptr += n;
     }
     let rel_key = own_key as i64 - parent_key as i64;
     if rel_key > 0 {
-        ctx.key_size_hist[rel_key.leading_zeros() as usize] += 1;
+        ctx.key_size_hist_pos[rel_key.leading_zeros() as usize] += 1;
     } else {
-        ctx.key_size_hist[rel_key.leading_ones() as usize] += 1;
+        ctx.key_size_hist_neg[rel_key.leading_ones() as usize] += 1;
     };
     let n = push_number(&mut ctx.buf, Value::RelKey(rel_key))?;
     ctx.bytes_in_keys += n;
+    match n {
+        1 => ctx.encoded_keys_len_1 += 1,
+        3 => ctx.encoded_keys_len_3 += 1,
+        9 => ctx.encoded_keys_len_9 += 1,
+        _ => panic!("Unexpected key length {}", n),
+    }
 
     Ok(ctx.buf.len() as u64)
 }

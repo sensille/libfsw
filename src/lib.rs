@@ -268,11 +268,32 @@ println!("expression: {:?}", expr);
     }
 
     pub fn build_table(&mut self) -> Result<()> {
+        // sort unwind entries by occurences
+        let mut entry_counts = HashMap::new();
+        // count occurences
+        for entry_opt in self.unwind_table.values() {
+            if let Some(entry_id) = entry_opt {
+                *entry_counts.entry(*entry_id).or_default() += 1;
+            }
+        }
+        // convert to vec and sort
+        let mut by_count: Vec<(usize, usize)> = entry_counts.into_iter().collect();
+        by_count.sort_by(|a, b| b.1.cmp(&a.1)); // descending
+
+        // build mapping from old entry id to new entry id
+        let mut entry_id_map = HashMap::new();
+        for (i, (e, _)) in by_count.iter().enumerate() {
+            entry_id_map.insert(*e as usize, i + 1); // new ids start at 1
+        }
+
         // convert to arr with u64 -> u64
         let mut arr = Vec::with_capacity(self.unwind_table.len());
         for ((oid, addr), entry_opt) in &self.unwind_table {
             assert!(*oid < 0xffff);
-            let entry_id = entry_opt.unwrap_or(0);
+            let entry_id = match entry_opt {
+                Some(eid) => *entry_id_map.get(eid).unwrap(),
+                None => 0,
+            };
             let key = ((*oid as u64) << 48) | *addr;
             arr.push((key, entry_id as u64));
         }
