@@ -208,7 +208,14 @@ fn build_recurse(
 
     let len = arr.len();
     // take out middle key
-    let mid = len / 2;
+    // find largest number that creates a tree with no empty pointers
+    let mut mid = 0;
+    while 2 * mid + 1 + 2 <= len {
+        mid = 2 * mid + 1;
+    }
+    if len == 2 {
+        mid = 1; // we want the right pointer to be empty
+    }
     let left = &arr[..mid];
     let right = &arr[mid + 1..];
     let own_key = arr[mid].0;
