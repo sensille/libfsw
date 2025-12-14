@@ -83,9 +83,9 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Value {
     EmptyPtr,
-    BothPtrEmpty,
     RelKey(i64),
     RelPtr(u64),
+    RelTailPtr(u64),
     Val(u64),
 }
 
@@ -93,16 +93,22 @@ pub(crate) enum Value {
 // encoding:
 // ptrs: we limit the table size to 2MB, so 21 bits
 //   00-EF: encode as 1 byte
-//   F0-F7: first byte with 3 lower bits of value, followd by 2 bytes (little-endian)
+//   F0-F7: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
 //   f8   : EmptyPtr
 //   f9   : BothPtrEmpty
 // values:
 //   00-F7: encode as 1 byte
-//   F8-FF: first byte with 3 lower bits of value, followd by 2 bytes (little-endian)
+//   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
 // RelKey:
 //   00-DE: 1 byte, val + 111
 //   DF   : followed by 8 bytes i64 (little-endian)
 //   E0-FF: lower 5 bits, followed by 2 bytes (little-endian)
+//
+// PtrOrTailPtr:
+//  01-DF: ptr as 1 byte
+//  E0-E7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//  E8-EF: tail ptrs first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//  F0-FF: tail ptrs as 1 byte
 //
 // Maximum encodable table size is 256k
 //
@@ -127,7 +133,34 @@ impl Value {
                     b
                 }
             }
-            Value::RelPtr(v) | Value::Val(v) => {
+            Value::RelPtr(v) => {
+                if *v <= 0xdf {
+                    Vec::from([*v as u8])
+                } else if *v <= 0x3ffff {
+                    let b0 = 0xf0 | (((*v >> 16) as u8) & 0x07);
+                    let b1 = (*v & 0xff) as u8;
+                    let b2 = ((*v >> 8) & 0xff) as u8;
+                    Vec::from([b0, b1, b2])
+                } else {
+println!("Value too large to encode: {:?}", self);
+                    return Err(FswError::TableValueEncodeError);
+                }
+            }
+            Value::RelTailPtr(v) => {
+                if *v <= 0x0f {
+                    Vec::from([*v as u8 + 0xf0])
+                } else if *v <= 0x3ffff {
+println!("large tail ptr for value: {:?}", self);
+                    let b0 = 0xe8 | (((*v >> 16) as u8) & 0x07);
+                    let b1 = (*v & 0xff) as u8;
+                    let b2 = ((*v >> 8) & 0xff) as u8;
+                    Vec::from([b0, b1, b2])
+                } else {
+println!("Value too large to encode: {:?}", self);
+                    return Err(FswError::TableValueEncodeError);
+                }
+            }
+            Value::Val(v) => {
                 if *v <= 0xef {
                     Vec::from([*v as u8])
                 } else if *v <= 0x3ffff {
@@ -140,17 +173,21 @@ println!("Value too large to encode: {:?}", self);
                     return Err(FswError::TableValueEncodeError);
                 }
             }
-            Value::EmptyPtr => Vec::from([0xf8]),
-            Value::BothPtrEmpty => Vec::from([0xf9]),
+            Value::EmptyPtr => Vec::from([0x00]),
         })
     }
+//  E0-E7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//  E8-EF: tail ptrs first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//  F0-FF: tail ptrs as 1 byte
     pub fn read_rel_ptr(b: &[u8]) -> Result<(Value, usize)> {
         let Some(v) = b.get(0) else {
             return Err(FswError::TableValueDecodeError);
         };
-        if *v < 0xf0 {
+        if *v == 0 {
+            Ok((Value::EmptyPtr, 1))
+        } else if *v < 0xe0 {
             Ok((Value::RelPtr(*v as u64), 1))
-        } else if *v >= 0xf0 && *v <= 0xf7 {
+        } else if *v < 0xe8 {
             let Some(b1) = b.get(1) else {
                 return Err(FswError::TableValueDecodeError);
             };
@@ -158,11 +195,18 @@ println!("Value too large to encode: {:?}", self);
                 return Err(FswError::TableValueDecodeError);
             };
             let val = (((*v as u64 & 0x07) << 16) | ((*b2 as u64) << 8) | (*b1 as u64)) as u64;
-            Ok((Value::Val(val), 3))
-        } else if *v == 0xf8 {
-            Ok((Value::EmptyPtr, 1))
+            Ok((Value::RelPtr(val), 3))
+        } else if *v < 0xf0 {
+            Ok((Value::RelPtr(*v as u64 & 0x0f), 1))
         } else {
-            Err(FswError::TableValueDecodeError)
+            let Some(b1) = b.get(1) else {
+                return Err(FswError::TableValueDecodeError);
+            };
+            let Some(b2) = b.get(2) else {
+                return Err(FswError::TableValueDecodeError);
+            };
+            let val = (((*v as u64 & 0x07) << 16) | ((*b2 as u64) << 8) | (*b1 as u64)) as u64;
+            Ok((Value::RelTailPtr(val), 3))
         }
     }
     pub fn read_val(b: &[u8]) -> Result<(Value, usize)> {
@@ -239,32 +283,37 @@ fn build_recurse(
     // we build from back to front, so push in reverse order
     let n = push_number(&mut ctx.buf, Value::Val(own_value))?;
     ctx.bytes_in_values += n;
-    if left_ptr == 0 && right_ptr == 0 {
-        ctx.both_pointers_empty += 1;
-        push_number(&mut ctx.buf, Value::BothPtrEmpty)?;
-    } else {
+    if len >= 3 {
         if right_ptr == 0 {
             push_number(&mut ctx.buf, Value::EmptyPtr)?;
             ctx.empty_right_pointers += 1;
             ctx.bytes_in_right_ptr += 1;
         } else {
             let pos = ctx.buf.len() as u64;
-            let n = push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?;
+            let n = if right.len() <= 3 {
+                push_number(&mut ctx.buf, Value::RelTailPtr(pos - right_ptr))?
+            } else {
+                push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?
+            };
             ctx.bytes_in_right_ptr += n;
             if len == 3 {
                 *ctx.leaf_ptrs.entry(pos - right_ptr).or_insert(0) += 1;
             }
             ctx.ptr_size_hist[(pos - right_ptr).leading_zeros() as usize] += 1;
         }
-        assert!(left_ptr != 0);
         let pos = ctx.buf.len() as u64;
-        let n = push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?;
+        let n = if left.len() <= 3 {
+            push_number(&mut ctx.buf, Value::RelTailPtr(pos - left_ptr))?
+        } else {
+            push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?
+        };
         ctx.bytes_in_left_ptr += n;
         if len == 3 {
             *ctx.leaf_ptrs.entry(pos - left_ptr).or_insert(0) += 1;
         }
         ctx.ptr_size_hist[(pos -left_ptr).leading_zeros() as usize] += 1;
     }
+
     let rel_key = own_key as i64 - parent_key as i64;
     if rel_key > 0 {
         ctx.key_size_hist_pos[rel_key.leading_zeros() as usize] += 1;
