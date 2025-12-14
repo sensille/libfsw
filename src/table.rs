@@ -12,6 +12,14 @@ use crate::Result;
  */
 struct BuildCtx {
     buf: Vec<u8>,       // built up from back to front
+    bytes_in_values: usize,
+    empty_left_pointers: usize,
+    bytes_in_left_ptr: usize,
+    empty_right_pointers: usize,
+    bytes_in_right_ptr: usize,
+    both_pointers_empty: usize,
+    bytes_in_keys: usize,
+    key_size_hist: [usize; 65],
 }
 
 pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
@@ -25,10 +33,26 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     */
     let mut ctx = BuildCtx {
         buf: Vec::new(),
+        bytes_in_values: 0,
+        empty_left_pointers: 0,
+        bytes_in_left_ptr: 0,
+        empty_right_pointers: 0,
+        bytes_in_right_ptr: 0,
+        both_pointers_empty: 0,
+        bytes_in_keys: 0,
+        key_size_hist: [0; 65],
     };
     build_recurse(&mut ctx, arr, 0)?;
 
     println!("Built table, size {} bytes", ctx.buf.len());
+    println!("  bytes in keys: {}", ctx.bytes_in_keys);
+    println!("  bytes in values: {}", ctx.bytes_in_values);
+    println!("  bytes in left ptrs: {}", ctx.bytes_in_left_ptr);
+    println!("    empty left ptrs: {}", ctx.empty_left_pointers);
+    println!("  bytes in right ptrs: {}", ctx.bytes_in_right_ptr);
+    println!("    empty right ptrs: {}", ctx.empty_right_pointers);
+    println!("  nodes with both ptrs empty: {}", ctx.both_pointers_empty);
+    println!("  key size histogram: {:?}", ctx.key_size_hist);
 
     ctx.buf.reverse();
 
@@ -142,11 +166,12 @@ println!("Value too large to encode: {:?}", self);
     }
 }
 
-fn push_number(buf: &mut Vec<u8>, n: Value) -> Result<()> {
+fn push_number(buf: &mut Vec<u8>, n: Value) -> Result<usize> {
     let mut b = n.as_bytes()?;
+    let l = b.len();
     b.reverse();
     buf.extend(b);
-    Ok(())
+    Ok(l)
 }
 
 fn build_recurse(
@@ -172,20 +197,35 @@ fn build_recurse(
     let right_ptr = build_recurse(ctx, right, own_key)?;
 
     // we build from back to front, so push in reverse order
-    push_number(&mut ctx.buf, Value::Val(own_value))?;
+    let n = push_number(&mut ctx.buf, Value::Val(own_value))?;
+    ctx.bytes_in_values += n;
     if right_ptr == 0 {
         push_number(&mut ctx.buf, Value::EmptyPtr)?;
+        ctx.empty_left_pointers += 1;
     } else {
         let pos = ctx.buf.len() as u64;
-        push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?;
+        let n = push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?;
+        ctx.bytes_in_left_ptr += n;
     }
     if left_ptr == 0 {
         push_number(&mut ctx.buf, Value::EmptyPtr)?;
+        ctx.empty_right_pointers += 1;
     } else {
         let pos = ctx.buf.len() as u64;
-        push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?;
+        let n = push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?;
+        ctx.bytes_in_right_ptr += n;
     }
-    push_number(&mut ctx.buf, Value::RelKey(own_key as i64 - parent_key as i64))?;
+    if left_ptr == 0 && right_ptr == 0 {
+        ctx.both_pointers_empty += 1;
+    }
+    let rel_key = own_key as i64 - parent_key as i64;
+    if rel_key > 0 {
+        ctx.key_size_hist[rel_key.leading_zeros() as usize] += 1;
+    } else {
+        ctx.key_size_hist[rel_key.leading_ones() as usize] += 1;
+    };
+    let n = push_number(&mut ctx.buf, Value::RelKey(rel_key))?;
+    ctx.bytes_in_keys += n;
 
     Ok(ctx.buf.len() as u64)
 }
