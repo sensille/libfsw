@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use crate::FswError;
 use crate::Result;
 
@@ -24,6 +25,8 @@ struct BuildCtx {
     encoded_keys_len_1: usize,
     encoded_keys_len_3: usize,
     encoded_keys_len_9: usize,
+    leaf_ptrs: BTreeMap<u64, usize>,
+    leaf_keys: [usize; 65],
 }
 
 pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
@@ -49,6 +52,8 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         encoded_keys_len_1: 0,
         encoded_keys_len_3: 0,
         encoded_keys_len_9: 0,
+        leaf_ptrs: BTreeMap::new(),
+        leaf_keys: [0; 65],
     };
     build_recurse(&mut ctx, arr, 0)?;
 
@@ -64,6 +69,8 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     println!("  key size histogram neg: {:?}", ctx.key_size_hist_neg);
     println!("  encoded keys length counts: len 1: {}, len 3: {}, len 9: {}",
         ctx.encoded_keys_len_1, ctx.encoded_keys_len_3, ctx.encoded_keys_len_9);
+    println!("  leaf ptr size histogram: {:?}", ctx.leaf_ptrs);
+    println!("  leaf key size histogram: {:?}", ctx.leaf_keys);
 
     ctx.buf.reverse();
 
@@ -241,11 +248,17 @@ fn build_recurse(
             let pos = ctx.buf.len() as u64;
             let n = push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?;
             ctx.bytes_in_right_ptr += n;
+            if len == 3 {
+                *ctx.leaf_ptrs.entry(pos - right_ptr).or_insert(0) += 1;
+            }
         }
         assert!(left_ptr != 0);
         let pos = ctx.buf.len() as u64;
         let n = push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?;
         ctx.bytes_in_left_ptr += n;
+        if len == 3 {
+            *ctx.leaf_ptrs.entry(pos - left_ptr).or_insert(0) += 1;
+        }
     }
     let rel_key = own_key as i64 - parent_key as i64;
     if rel_key > 0 {
@@ -261,6 +274,15 @@ fn build_recurse(
         9 => ctx.encoded_keys_len_9 += 1,
         _ => panic!("Unexpected key length {}", n),
     }
+    if len == 3 {
+        let v = if rel_key < 0 {
+            rel_key.leading_ones()
+        } else {
+            rel_key.leading_zeros()
+        };
+        ctx.leaf_keys[v as usize] += 1;
+    }
+
 
     Ok(ctx.buf.len() as u64)
 }
