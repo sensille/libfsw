@@ -22,6 +22,7 @@ struct BuildCtx {
     bytes_in_keys: usize,
     key_size_hist_pos: [usize; 65],
     key_size_hist_neg: [usize; 65],
+    ptr_size_hist: [usize; 65],
     encoded_keys_len_1: usize,
     encoded_keys_len_3: usize,
     encoded_keys_len_9: usize,
@@ -54,6 +55,7 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         encoded_keys_len_9: 0,
         leaf_ptrs: BTreeMap::new(),
         leaf_keys: [0; 65],
+        ptr_size_hist: [0; 65],
     };
     build_recurse(&mut ctx, arr, 0)?;
 
@@ -71,6 +73,7 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         ctx.encoded_keys_len_1, ctx.encoded_keys_len_3, ctx.encoded_keys_len_9);
     println!("  leaf ptr size histogram: {:?}", ctx.leaf_ptrs);
     println!("  leaf key size histogram: {:?}", ctx.leaf_keys);
+    println!("  ptr size histogram: {:?}", ctx.ptr_size_hist);
 
     ctx.buf.reverse();
 
@@ -251,6 +254,7 @@ fn build_recurse(
             if len == 3 {
                 *ctx.leaf_ptrs.entry(pos - right_ptr).or_insert(0) += 1;
             }
+            ctx.ptr_size_hist[(pos - right_ptr).leading_zeros() as usize] += 1;
         }
         assert!(left_ptr != 0);
         let pos = ctx.buf.len() as u64;
@@ -259,6 +263,7 @@ fn build_recurse(
         if len == 3 {
             *ctx.leaf_ptrs.entry(pos - left_ptr).or_insert(0) += 1;
         }
+        ctx.ptr_size_hist[(pos -left_ptr).leading_zeros() as usize] += 1;
     }
     let rel_key = own_key as i64 - parent_key as i64;
     if rel_key > 0 {
