@@ -14,12 +14,14 @@ use crate::Result;
 struct BuildCtx {
     buf: Vec<u8>,       // built up from back to front
     bytes_in_values: usize,
+    num_values: usize,
     empty_left_pointers: usize,
     bytes_in_left_ptr: usize,
     empty_right_pointers: usize,
     bytes_in_right_ptr: usize,
     both_pointers_empty: usize,
     bytes_in_keys: usize,
+    num_keys: usize,
     key_size_hist_pos: [usize; 65],
     key_size_hist_neg: [usize; 65],
     ptr_size_hist: [usize; 65],
@@ -28,6 +30,7 @@ struct BuildCtx {
     encoded_keys_len_9: usize,
     leaf_ptrs: BTreeMap<u64, usize>,
     leaf_keys: [usize; 65],
+    unmarked_leafs: usize,
 }
 
 pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
@@ -56,8 +59,11 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         leaf_ptrs: BTreeMap::new(),
         leaf_keys: [0; 65],
         ptr_size_hist: [0; 65],
+        unmarked_leafs: 0,
+        num_values: 0,
+        num_keys: 0,
     };
-    build_recurse(&mut ctx, arr, 0)?;
+    build_recurse(&mut ctx, arr, 0, false)?;
 
     println!("Built table, size {} bytes", ctx.buf.len());
     println!("  bytes in keys: {}", ctx.bytes_in_keys);
@@ -74,6 +80,9 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     println!("  leaf ptr size histogram: {:?}", ctx.leaf_ptrs);
     println!("  leaf key size histogram: {:?}", ctx.leaf_keys);
     println!("  ptr size histogram: {:?}", ctx.ptr_size_hist);
+    println!("  unmarked leafs: {}", ctx.unmarked_leafs);
+    println!("  total keys: {}", ctx.num_keys);
+    println!("  total values: {}", ctx.num_values);
 
     ctx.buf.reverse();
 
@@ -85,8 +94,9 @@ pub(crate) enum Value {
     EmptyPtr,
     RelKey(i64),
     RelPtr(u64),
-    RelTailPtr(u64),
+    RelLeafPtr(u64),
     Val(u64),
+    UnmarkedLeaf(usize),
 }
 
 //
@@ -100,7 +110,11 @@ pub(crate) enum Value {
 //   00-F7: encode as 1 byte
 //   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
 // RelKey:
-//   00-DE: 1 byte, val + 111
+//   00-DA: 1 byte, val + 109
+//   DB   : leaf with 0 entries
+//   DC   : leaf with 1 entries
+//   DD   : leaf with 2 entries
+//   DE   : leaf with 3 entries
 //   DF   : followed by 8 bytes i64 (little-endian)
 //   E0-FF: lower 5 bits, followed by 2 bytes (little-endian)
 //
@@ -116,8 +130,8 @@ impl Value {
     pub fn as_bytes(&self) -> Result<Vec<u8>> {
         Ok(match self {
             Value::RelKey(v) => {
-                if *v >= -111 && *v <= 111 {
-                    Vec::from([(*v as i8 + 111) as u8])
+                if *v >= -109 && *v <= 109 {
+                    Vec::from([(*v as i8 + 109) as u8])
                 } else if *v >= -0x1f_ffff && *v <= 0x1f_ffff {
                     let mut b = Vec::with_capacity(3);
                     let v_u = *v as u64;
@@ -146,7 +160,7 @@ println!("Value too large to encode: {:?}", self);
                     return Err(FswError::TableValueEncodeError);
                 }
             }
-            Value::RelTailPtr(v) => {
+            Value::RelLeafPtr(v) => {
                 if *v <= 0x1f {
                     Vec::from([*v as u8 + 0xe0])
                 } else if *v <= 0x3ffff {
@@ -174,6 +188,7 @@ println!("Value too large to encode: {:?}", self);
                 }
             }
             Value::EmptyPtr => Vec::from([0x00]),
+            Value::UnmarkedLeaf(usize) => Vec::from([0xdb + (*usize as u8)]),
         })
     }
 //  E0-E7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
@@ -206,7 +221,7 @@ println!("Value too large to encode: {:?}", self);
                 return Err(FswError::TableValueDecodeError);
             };
             let val = (((*v as u64 & 0x07) << 16) | ((*b2 as u64) << 8) | (*b1 as u64)) as u64;
-            Ok((Value::RelTailPtr(val), 3))
+            Ok((Value::RelLeafPtr(val), 3))
         }
     }
     pub fn read_val(b: &[u8]) -> Result<(Value, usize)> {
@@ -255,65 +270,119 @@ fn build_recurse(
     ctx: &mut BuildCtx,
     arr: &[(u64, u64)],
     parent_key: u64,
+    marked_as_leaf: bool,
 ) -> Result<u64> {
-    if arr.is_empty() {
-        return Ok(0);
-    }
-
+    // observations:
+    //   - due to the rules the split point is chosen, the left subtree will
+    //     always be full, so either a node has 2 full leaves or is a leaf itself
+    //   - if the left node is a leaf, the right also is
+    //   - if the left node is not a leaf, the right may be a leaf. As there is
+    //     no right pointer, we can't encode the leafness into the pointer, so
+    //     we encode it into the key
+    //   - the right node always immediately follows its parent, so we don't need
+    //     a right pointer
+    //   - to be able to calculate the forward pointers, we have to build from back
+    //     to front
     let len = arr.len();
-    // take out middle key
-    // find largest number that creates a tree with no empty pointers
-    let mut mid = 0;
-    while 2 * mid + 1 + 2 <= len {
-        mid = 2 * mid + 1;
-    }
-    if len == 2 {
-        mid = 1; // we want the right pointer to be empty
-    }
-    let left = &arr[..mid];
-    let right = &arr[mid + 1..];
-    let own_key = arr[mid].0;
-    let own_value = arr[mid].1;
-//    println!("build_recurse: {} entries, middle {} left len {} right len {}",
-//       arr.len(), mid, left.len(), right.len());
 
-    let left_ptr = build_recurse(ctx, left, own_key)?;
-    let right_ptr = build_recurse(ctx, right, own_key)?;
+    /*
+     * leaf node
+     */
+    if len <= 3 {
+        // [<leaf marker>] <key> [<left key> <left value>] [<right key> <right value>] <own value>
+        // emitted back to front
 
-    // we build from back to front, so push in reverse order
+
+        // own value
+        if len > 0 {
+            let own_val = if len >= 2 { arr[1].1 } else { arr[0].1 };
+            let n = push_number(&mut ctx.buf, Value::Val(own_val))?;
+            ctx.bytes_in_values += n;
+            ctx.num_values += 1;
+        }
+
+        // right key/value
+        if len == 3 {
+            let n = push_number(&mut ctx.buf, Value::Val(arr[2].1))?;
+            ctx.bytes_in_values += n;
+            ctx.num_values += 1;
+            let n = push_number(&mut ctx.buf, Value::RelKey(parent_key as i64 - arr[2].0 as i64))?;
+            ctx.bytes_in_keys += n;
+            ctx.num_keys += 1;
+        }
+
+        // left key/value
+        if len >= 2 {
+            let n = push_number(&mut ctx.buf, Value::Val(arr[0].1))?;
+            ctx.bytes_in_values += n;
+            ctx.num_values += 1;
+            let n = push_number(&mut ctx.buf, Value::RelKey(parent_key as i64 - arr[0].0 as i64))?;
+            ctx.bytes_in_keys += n;
+            ctx.num_keys += 1;
+        }
+
+        // own key
+        if len >= 1 {
+            let own_key = if len >= 2 { arr[1].0 } else { arr[0].0 };
+            let n = push_number(&mut ctx.buf, Value::RelKey(parent_key as i64 - own_key as i64))?;
+            ctx.bytes_in_keys += n;
+            ctx.num_keys += 1;
+        }
+
+if len < 3 { println!("Built leaf node with {} entries", len); }
+        // leaf marker
+        if !marked_as_leaf {
+            ctx.unmarked_leafs += 1;
+            push_number(&mut ctx.buf, Value::UnmarkedLeaf(len))?;
+        }
+
+        return Ok(ctx.buf.len() as u64);
+    }
+
+    /*
+     * intermediate node
+     */
+
+
+    // split_point: find largest number that creates a tree with no empty pointers
+    let mut split = 3;
+    while 2 * split + 1 + 2 <= len {
+        split = 2 * split + 1;
+    }
+    let left = &arr[..split];
+    let right = &arr[split + 1..];
+    let own_key = arr[split].0;
+    let own_value = arr[split].1;
+    //println!("build_recurse: {} entries, split {} left len {} right len {}",
+    //   arr.len(), split, left.len(), right.len());
+
+    assert!(left.len() >= 3);
+    let left_is_leaf = left.len() == 3;
+
+    // <own key> <left ptr> <own value> <right subtree> <left subtree>
+    // built from back to front
+    // left subtree
+    let left_ptr = build_recurse(ctx, left, own_key, left_is_leaf)?;
+    // right subtree
+    let right_ptr = build_recurse(ctx, right, own_key, left_is_leaf)?;
+
+    // own value
     let n = push_number(&mut ctx.buf, Value::Val(own_value))?;
     ctx.bytes_in_values += n;
-    if len >= 3 {
-        if right_ptr == 0 {
-            push_number(&mut ctx.buf, Value::EmptyPtr)?;
-            ctx.empty_right_pointers += 1;
-            ctx.bytes_in_right_ptr += 1;
-        } else {
-            let pos = ctx.buf.len() as u64;
-            let n = if right.len() <= 3 {
-                push_number(&mut ctx.buf, Value::RelTailPtr(pos - right_ptr))?
-            } else {
-                push_number(&mut ctx.buf, Value::RelPtr(pos - right_ptr))?
-            };
-            ctx.bytes_in_right_ptr += n;
-            if len == 3 {
-                *ctx.leaf_ptrs.entry(pos - right_ptr).or_insert(0) += 1;
-            }
-            ctx.ptr_size_hist[(pos - right_ptr).leading_zeros() as usize] += 1;
-        }
-        let pos = ctx.buf.len() as u64;
-        let n = if left.len() <= 3 {
-            push_number(&mut ctx.buf, Value::RelTailPtr(pos - left_ptr))?
-        } else {
-            push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?
-        };
-        ctx.bytes_in_left_ptr += n;
-        if len == 3 {
-            *ctx.leaf_ptrs.entry(pos - left_ptr).or_insert(0) += 1;
-        }
-        ctx.ptr_size_hist[(pos -left_ptr).leading_zeros() as usize] += 1;
-    }
+    ctx.num_values += 1;
 
+    // left ptr
+    let pos = ctx.buf.len() as u64;
+    let n = if left_is_leaf {
+        *ctx.leaf_ptrs.entry(pos - right_ptr).or_insert(0) += 1;
+        push_number(&mut ctx.buf, Value::RelLeafPtr(pos - left_ptr))?
+    } else {
+        push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?
+    };
+    ctx.bytes_in_left_ptr += n;
+    ctx.ptr_size_hist[(pos -left_ptr).leading_zeros() as usize] += 1;
+
+    // own key
     let rel_key = own_key as i64 - parent_key as i64;
     if rel_key > 0 {
         ctx.key_size_hist_pos[rel_key.leading_zeros() as usize] += 1;
@@ -322,6 +391,7 @@ fn build_recurse(
     };
     let n = push_number(&mut ctx.buf, Value::RelKey(rel_key))?;
     ctx.bytes_in_keys += n;
+    ctx.num_keys += 1;
     match n {
         1 => ctx.encoded_keys_len_1 += 1,
         3 => ctx.encoded_keys_len_3 += 1,
@@ -336,7 +406,6 @@ fn build_recurse(
         };
         ctx.leaf_keys[v as usize] += 1;
     }
-
 
     Ok(ctx.buf.len() as u64)
 }
