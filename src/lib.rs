@@ -3,6 +3,8 @@ use gimli::{ UnwindSection, Register };
 use thiserror::Error;
 use std::collections::{ HashMap, BTreeMap, BTreeSet };
 
+mod table;
+
 #[derive(Error, Debug)]
 pub enum FswError {
     #[error("File open failed")]
@@ -21,6 +23,12 @@ pub enum FswError {
     GimliError(gimli::Error),
     #[error("CIE missing for FDE")]
     MissingCie,
+    #[error("OID too large, needs to fit in 16 bits")]
+    OidTooLarge,
+    #[error("Can't encode table value")]
+    TableValueEncodeError,
+    #[error("Can't decode table value")]
+    TableValueDecodeError,
 
 }
 use FswError::*;
@@ -69,6 +77,7 @@ pub struct Fsw {
     expressions: BTreeMap<usize, Vec<u8>>,
     expressions_rev: BTreeMap<Vec<u8>, usize>,
     parsing_errors: HashMap<ParsingError, u64>,
+    next_entry_id: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -89,6 +98,7 @@ impl Fsw {
             expressions: BTreeMap::new(),
             expressions_rev: BTreeMap::new(),
             parsing_errors: HashMap::new(),
+            next_entry_id: 1,
         }
     }
 
@@ -96,6 +106,9 @@ impl Fsw {
     pub fn add_file<P: AsRef<std::path::Path>>(&mut self, path: P, oid: usize)
         -> Result<()>
     {
+        if oid > 0xffff {
+            return Err(OidTooLarge);
+        }
         let file = std::fs::File::open(path).map_err(FileOpenError)?;
 
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(MmapError)? };
@@ -106,6 +119,7 @@ impl Fsw {
             .ok_or(NoEhInfo)?;
 
         let eh_frame_data = eh_frame_section.uncompressed_data().map_err(ObjectParseError)?;
+println!("Parsing .eh_frame of size {}", eh_frame_data.len());
         let eh_frame = gimli::EhFrame::new(&eh_frame_data, gimli::NativeEndian);
         let bases = gimli::BaseAddresses::default()
             .set_eh_frame(eh_frame_section.address());
@@ -192,7 +206,8 @@ impl Fsw {
                         let entryid = if let Some(id) = self.unwind_entries_rev.get(&entry) {
                             *id
                         } else {
-                            let id = self.unwind_entries.len();
+                            let id = self.next_entry_id;
+                            self.next_entry_id += 1;
                             self.unwind_entries.insert(id, entry.clone());
                             self.unwind_entries_rev.insert(entry, id);
                             id
@@ -252,15 +267,19 @@ println!("expression: {:?}", expr);
         }
     }
 
-    fn build_table(&mut self) {
-        // table format:
-        // header: u64 start address
-        // body: all varints
-        //    (1) varint delta to base,
-        //    (2) varint offset to left
-        //    (3) varint offset to right
-        //    (4) varint entry id
-        //
+    pub fn build_table(&mut self) -> Result<()> {
+        // convert to arr with u64 -> u64
+        let mut arr = Vec::with_capacity(self.unwind_table.len());
+        for ((oid, addr), entry_opt) in &self.unwind_table {
+            assert!(*oid < 0xffff);
+            let entry_id = entry_opt.unwrap_or(0);
+            let key = ((*oid as u64) << 48) | *addr;
+            arr.push((key, entry_id as u64));
+        }
+        let table = table::build(&arr[0..50000])?;
+
+        println!("Final unwind table size: {}", table.len());
+        Err(NoEhInfo) // XXX
     }
 }
 
@@ -307,7 +326,7 @@ pub fn read_process_maps(pid: u32) -> Result<Vec<ProcessMap>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    //use super::*;
 
     #[test]
     fn it_works() {
