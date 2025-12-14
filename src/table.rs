@@ -105,10 +105,10 @@ pub(crate) enum Value {
 //   E0-FF: lower 5 bits, followed by 2 bytes (little-endian)
 //
 // PtrOrTailPtr:
-//  01-DF: ptr as 1 byte
-//  E0-E7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
-//  E8-EF: tail ptrs first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
-//  F0-FF: tail ptrs as 1 byte
+//  01-CF: ptr as 1 byte
+//  D0-D7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//  D8-DF: tail ptrs first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//  E0-FF: tail ptrs as 1 byte
 //
 // Maximum encodable table size is 256k
 //
@@ -134,10 +134,10 @@ impl Value {
                 }
             }
             Value::RelPtr(v) => {
-                if *v <= 0xdf {
+                if *v <= 0xcf {
                     Vec::from([*v as u8])
                 } else if *v <= 0x3ffff {
-                    let b0 = 0xf0 | (((*v >> 16) as u8) & 0x07);
+                    let b0 = 0xd0 | (((*v >> 16) as u8) & 0x07);
                     let b1 = (*v & 0xff) as u8;
                     let b2 = ((*v >> 8) & 0xff) as u8;
                     Vec::from([b0, b1, b2])
@@ -147,11 +147,11 @@ println!("Value too large to encode: {:?}", self);
                 }
             }
             Value::RelTailPtr(v) => {
-                if *v <= 0x0f {
-                    Vec::from([*v as u8 + 0xf0])
+                if *v <= 0x1f {
+                    Vec::from([*v as u8 + 0xe0])
                 } else if *v <= 0x3ffff {
 println!("large tail ptr for value: {:?}", self);
-                    let b0 = 0xe8 | (((*v >> 16) as u8) & 0x07);
+                    let b0 = 0xd8 | (((*v >> 16) as u8) & 0x07);
                     let b1 = (*v & 0xff) as u8;
                     let b2 = ((*v >> 8) & 0xff) as u8;
                     Vec::from([b0, b1, b2])
