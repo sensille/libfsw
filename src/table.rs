@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use crate::FswError;
 use crate::Result;
 
@@ -14,82 +13,28 @@ use crate::Result;
 struct BuildCtx {
     buf: Vec<u8>,       // built up from back to front
     bytes_in_values: usize,
-    num_values: usize,
-    empty_left_pointers: usize,
-    bytes_in_left_ptr: usize,
-    num_left_ptr: usize,
-    empty_right_pointers: usize,
-    bytes_in_right_ptr: usize,
-    both_pointers_empty: usize,
+    bytes_in_ptr: usize,
     bytes_in_keys: usize,
-    num_keys: usize,
-    key_size_hist_pos: [usize; 65],
-    key_size_hist_neg: [usize; 65],
-    ptr_size_hist: [usize; 65],
-    encoded_keys_len_1: usize,
-    encoded_keys_len_2: usize,
-    encoded_keys_len_3: usize,
-    encoded_keys_len_9: usize,
-    leaf_ptrs: BTreeMap<u64, usize>,
-    leaf_keys: [usize; 65],
     unmarked_leaves: usize,
 }
 
 // keys have to be sorted and strictly increasing
 pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     println!("Building table with {} entries", arr.len());
-    /*
-    let mut arr = Vec::with_capacity(map.len());
-    // expand map into array so we can address it by index
-    for (key, value) in map {
-        arr.push((key as i64, value));
-    }
-    */
     let mut ctx = BuildCtx {
         buf: Vec::new(),
         bytes_in_values: 0,
-        empty_left_pointers: 0,
-        bytes_in_left_ptr: 0,
-        empty_right_pointers: 0,
-        bytes_in_right_ptr: 0,
-        both_pointers_empty: 0,
+        bytes_in_ptr: 0,
         bytes_in_keys: 0,
-        key_size_hist_pos: [0; 65],
-        key_size_hist_neg: [0; 65],
-        encoded_keys_len_1: 0,
-        encoded_keys_len_2: 0,
-        encoded_keys_len_3: 0,
-        encoded_keys_len_9: 0,
-        leaf_ptrs: BTreeMap::new(),
-        leaf_keys: [0; 65],
-        ptr_size_hist: [0; 65],
         unmarked_leaves: 0,
-        num_values: 0,
-        num_keys: 0,
-        num_left_ptr: 0,
     };
     build_recurse(&mut ctx, arr, 0, true)?;
 
     println!("Built table, size {} bytes", ctx.buf.len());
     println!("  bytes in keys: {}", ctx.bytes_in_keys);
+    println!("  bytes in ptrs: {}", ctx.bytes_in_ptr);
     println!("  bytes in values: {}", ctx.bytes_in_values);
-    println!("  bytes in left ptrs: {}", ctx.bytes_in_left_ptr);
-    println!("    empty left ptrs: {}", ctx.empty_left_pointers);
-    println!("  bytes in right ptrs: {}", ctx.bytes_in_right_ptr);
-    println!("    empty right ptrs: {}", ctx.empty_right_pointers);
-    println!("  nodes with both ptrs empty: {}", ctx.both_pointers_empty);
-    println!("  key size histogram pos: {:?}", ctx.key_size_hist_pos);
-    println!("  key size histogram neg: {:?}", ctx.key_size_hist_neg);
-    println!("  encoded keys length counts: len 1: {}, len 2: {}, len 3: {}, len 9: {}",
-        ctx.encoded_keys_len_1, ctx.encoded_keys_len_2,
-        ctx.encoded_keys_len_3, ctx.encoded_keys_len_9);
-    println!("  leaf ptr size histogram: {:?}", ctx.leaf_ptrs);
-    println!("  leaf key size histogram: {:?}", ctx.leaf_keys);
-    println!("  ptr size histogram: {:?}", ctx.ptr_size_hist);
     println!("  unmarked leaves: {}", ctx.unmarked_leaves);
-    println!("  total keys: {}", ctx.num_keys);
-    println!("  total values: {}", ctx.num_values);
-    println!("  total left ptrs: {}", ctx.num_left_ptr);
 
     ctx.buf.reverse();
 
@@ -299,10 +244,8 @@ fn build_recurse(
         if len == 3 {
             let n = push(&mut ctx.buf, enc_val(arr[2].1)?)?;
             ctx.bytes_in_values += n;
-            ctx.num_values += 1;
             let n = push(&mut ctx.buf, enc_rel_key(arr[2].0 as i64 - own_key as i64)?)?;
             ctx.bytes_in_keys += n;
-            ctx.num_keys += 1;
         } else {
             // dummy entry
             push(&mut ctx.buf, enc_val(0)?)?;
@@ -314,7 +257,6 @@ fn build_recurse(
             let own_val = if len >= 2 { arr[1].1 } else { arr[0].1 };
             let n = push(&mut ctx.buf, enc_val(own_val)?)?;
             ctx.bytes_in_values += n;
-            ctx.num_values += 1;
         } else {
             // dummy entry
             push(&mut ctx.buf, enc_val(0)?)?;
@@ -324,10 +266,8 @@ fn build_recurse(
         if len >= 2 {
             let n = push(&mut ctx.buf, enc_val(arr[0].1)?)?;
             ctx.bytes_in_values += n;
-            ctx.num_values += 1;
             let n = push(&mut ctx.buf, enc_rel_key(arr[0].0 as i64 - own_key as i64)?)?;
             ctx.bytes_in_keys += n;
-            ctx.num_keys += 1;
         } else {
             // dummy entry
             push(&mut ctx.buf, enc_val(0)?)?;
@@ -344,13 +284,10 @@ fn build_recurse(
         if len >= 1 {
             let n = push(&mut ctx.buf, enc_rel_key(own_key as i64 - parent_key as i64)?)?;
             ctx.bytes_in_keys += n;
-            ctx.num_keys += 1;
         } else {
             // dummy entry
             push(&mut ctx.buf, enc_rel_key(0)?)?;
         }
-
-//if len <= 3 { println!("Built leaf node with {} entries unmarked {}", len, unmarked_leaf); }
 
         return Ok(ctx.buf.len() as u64);
     }
@@ -386,45 +323,20 @@ fn build_recurse(
     // own value
     let n = push(&mut ctx.buf, enc_val(own_value)?)?;
     ctx.bytes_in_values += n;
-    ctx.num_values += 1;
 
     // left ptr
     let pos = ctx.buf.len() as u64;
     let n = if left_is_leaf {
-        *ctx.leaf_ptrs.entry(pos - right_ptr).or_insert(0) += 1;
         push(&mut ctx.buf, enc_rel_leaf_ptr(pos - left_ptr)?)?
     } else {
         push(&mut ctx.buf, enc_rel_ptr(pos - left_ptr)?)?
     };
-    ctx.bytes_in_left_ptr += n;
-    ctx.num_left_ptr += 1;
-    ctx.ptr_size_hist[(pos -left_ptr).leading_zeros() as usize] += 1;
+    ctx.bytes_in_ptr += n;
 
     // own key
     let rel_key = own_key as i64 - parent_key as i64;
-    if rel_key > 0 {
-        ctx.key_size_hist_pos[rel_key.leading_zeros() as usize] += 1;
-    } else {
-        ctx.key_size_hist_neg[rel_key.leading_ones() as usize] += 1;
-    };
     let n = push(&mut ctx.buf, enc_rel_key(rel_key)?)?;
     ctx.bytes_in_keys += n;
-    ctx.num_keys += 1;
-    match n {
-        1 => ctx.encoded_keys_len_1 += 1,
-        2 => ctx.encoded_keys_len_2 += 1,
-        3 => ctx.encoded_keys_len_3 += 1,
-        9 => ctx.encoded_keys_len_9 += 1,
-        _ => panic!("Unexpected key length {}", n),
-    }
-    if len == 3 {
-        let v = if rel_key < 0 {
-            rel_key.leading_ones()
-        } else {
-            rel_key.leading_zeros()
-        };
-        ctx.leaf_keys[v as usize] += 1;
-    }
 
     Ok(ctx.buf.len() as u64)
 }
@@ -440,7 +352,6 @@ mod tests {
         parent_key: i64, mut is_leaf: bool)
         -> Result<()>
     {
-        let own_offset = offset;
         let (mut own_key, advance) = dec_rel_key(&table[offset..])?;
         own_key += parent_key;
         offset += advance;
@@ -519,7 +430,6 @@ mod tests {
             current_key += parent_key;
 
             if !is_leaf && is_leaf_marker(&table[offset..])? {
-//println!("Found unmarked leaf marker at offset {}", offset);
                 offset += 1;
                 is_leaf = true;
             };
@@ -532,7 +442,6 @@ mod tests {
                 parent_key = current_key;
 
                 if search_key < current_key as u64 {
-//println!("Going to left child at offset {} current_key {}", offset + left_ptr as usize, current_key);
                     // go to left child
                     offset += left_ptr as usize;
                 } else {
@@ -540,20 +449,17 @@ mod tests {
                     offset += advance;
                     best = Some((current_key as u64, current_val));
                     // continue with right child
-//println!("Going to right child at offset {} with best {:?} current_key {}", offset, best, current_key);
                 }
 
                 is_leaf = left_is_leaf;
                 continue;
             }
 
-//println!("At leaf node at offset {}", offset);
             // leaf node case
             let (left_key, advance) = dec_rel_key(&table[offset..])?;
             offset += advance;
             let (left_value, advance) = dec_val(&table[offset..])?;
             offset += advance;
-//println!("Leaf keys: left_key {} ", left_key + current_key);
 
             // own value
             let (own_value, advance) = dec_val(&table[offset..])?;
@@ -561,10 +467,8 @@ mod tests {
 
             if search_key < current_key as u64 {
                 if left_key != 0 && search_key >= (left_key + current_key) as u64 {
-//    println!("Taking left key/value at leaf key {}", current_key + left_key);
                         return Ok(Some(((left_key + current_key) as u64, left_value)));
                 }
-//println!("No suitable key found at leaf, returning best {:?}", best);
                 return Ok(best);
             }
 
@@ -574,11 +478,9 @@ mod tests {
             let (right_value, _) = dec_val(&table[offset..])?;
 
             if right_key != 0 && search_key >= (right_key + current_key) as u64 {
-//println!("Taking right key/value at leaf key {}", current_key + right_key);
                 return Ok(Some(((right_key + current_key) as u64, right_value)));
             }
 
-//println!("Taking own key/value at leaf key {}", current_key);
             return Ok(Some((current_key as u64, own_value)));
         }
     }
