@@ -17,6 +17,7 @@ struct BuildCtx {
     num_values: usize,
     empty_left_pointers: usize,
     bytes_in_left_ptr: usize,
+    num_left_ptr: usize,
     empty_right_pointers: usize,
     bytes_in_right_ptr: usize,
     both_pointers_empty: usize,
@@ -26,6 +27,7 @@ struct BuildCtx {
     key_size_hist_neg: [usize; 65],
     ptr_size_hist: [usize; 65],
     encoded_keys_len_1: usize,
+    encoded_keys_len_2: usize,
     encoded_keys_len_3: usize,
     encoded_keys_len_9: usize,
     leaf_ptrs: BTreeMap<u64, usize>,
@@ -54,6 +56,7 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         key_size_hist_pos: [0; 65],
         key_size_hist_neg: [0; 65],
         encoded_keys_len_1: 0,
+        encoded_keys_len_2: 0,
         encoded_keys_len_3: 0,
         encoded_keys_len_9: 0,
         leaf_ptrs: BTreeMap::new(),
@@ -62,8 +65,9 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         unmarked_leafs: 0,
         num_values: 0,
         num_keys: 0,
+        num_left_ptr: 0,
     };
-    build_recurse(&mut ctx, arr, 0, false)?;
+    build_recurse(&mut ctx, arr, 0, true)?;
 
     println!("Built table, size {} bytes", ctx.buf.len());
     println!("  bytes in keys: {}", ctx.bytes_in_keys);
@@ -75,14 +79,16 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     println!("  nodes with both ptrs empty: {}", ctx.both_pointers_empty);
     println!("  key size histogram pos: {:?}", ctx.key_size_hist_pos);
     println!("  key size histogram neg: {:?}", ctx.key_size_hist_neg);
-    println!("  encoded keys length counts: len 1: {}, len 3: {}, len 9: {}",
-        ctx.encoded_keys_len_1, ctx.encoded_keys_len_3, ctx.encoded_keys_len_9);
+    println!("  encoded keys length counts: len 1: {}, len 2: {}, len 3: {}, len 9: {}",
+        ctx.encoded_keys_len_1, ctx.encoded_keys_len_2,
+        ctx.encoded_keys_len_3, ctx.encoded_keys_len_9);
     println!("  leaf ptr size histogram: {:?}", ctx.leaf_ptrs);
     println!("  leaf key size histogram: {:?}", ctx.leaf_keys);
     println!("  ptr size histogram: {:?}", ctx.ptr_size_hist);
     println!("  unmarked leafs: {}", ctx.unmarked_leafs);
     println!("  total keys: {}", ctx.num_keys);
     println!("  total values: {}", ctx.num_values);
+    println!("  total left ptrs: {}", ctx.num_left_ptr);
 
     ctx.buf.reverse();
 
@@ -96,16 +102,15 @@ pub(crate) enum Value {
     RelPtr(u64),
     RelLeafPtr(u64),
     Val(u64),
-    UnmarkedLeaf(usize),
+    LeafMarker(usize),
 }
 
 //
 // encoding:
 // ptrs: we limit the table size to 2MB, so 21 bits
-//   00-EF: encode as 1 byte
-//   F0-F7: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
-//   f8   : EmptyPtr
-//   f9   : BothPtrEmpty
+//   00-f6: encode as 1 byte
+//   f7   : leaf marker
+//   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
 // values:
 //   00-F7: encode as 1 byte
 //   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
@@ -130,8 +135,10 @@ impl Value {
     pub fn as_bytes(&self) -> Result<Vec<u8>> {
         Ok(match self {
             Value::RelKey(v) => {
-                if *v >= -109 && *v <= 109 {
+                if *v >= -111 && *v <= 111 {
+                //if *v >= -109 && *v <= 109 {
                     Vec::from([(*v as i8 + 109) as u8])
+                        /*
                 } else if *v >= -0x1f_ffff && *v <= 0x1f_ffff {
                     let mut b = Vec::with_capacity(3);
                     let v_u = *v as u64;
@@ -139,6 +146,15 @@ impl Value {
                     b.push(b0);
                     b.push((v_u & 0xff) as u8);
                     b.push(((v_u >> 8) & 0xff) as u8);
+                    b
+                        */
+                } else if *v >= -0x1fff && *v <= 0x1fff {
+                    let mut b = Vec::with_capacity(3);
+                    let v_u = *v as u64;
+                    let b0 = 0xe0 | ((v_u as u8) & 0x1f);
+                    b.push(b0);
+                    b.push((v_u & 0xff) as u8);
+                    //b.push(((v_u >> 8) & 0xff) as u8);
                     b
                 } else {
                     let mut b = Vec::with_capacity(9);
@@ -148,7 +164,7 @@ impl Value {
                 }
             }
             Value::RelPtr(v) => {
-                if *v <= 0xcf {
+                if *v <= 0xce {
                     Vec::from([*v as u8])
                 } else if *v <= 0x3ffff {
                     let b0 = 0xd0 | (((*v >> 16) as u8) & 0x07);
@@ -188,7 +204,7 @@ println!("Value too large to encode: {:?}", self);
                 }
             }
             Value::EmptyPtr => Vec::from([0x00]),
-            Value::UnmarkedLeaf(usize) => Vec::from([0xdb + (*usize as u8)]),
+            Value::LeafMarker(usize) => Vec::from([0x00, (*usize as u8)]),
         })
     }
 //  E0-E7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
@@ -270,7 +286,7 @@ fn build_recurse(
     ctx: &mut BuildCtx,
     arr: &[(u64, u64)],
     parent_key: u64,
-    marked_as_leaf: bool,
+    unmarked_leaf: bool,
 ) -> Result<u64> {
     // observations:
     //   - due to the rules the split point is chosen, the left subtree will
@@ -321,6 +337,12 @@ fn build_recurse(
             ctx.num_keys += 1;
         }
 
+        // leaf marker
+        if unmarked_leaf {
+            ctx.unmarked_leafs += 1;
+            push_number(&mut ctx.buf, Value::LeafMarker(len))?;
+        }
+
         // own key
         if len >= 1 {
             let own_key = if len >= 2 { arr[1].0 } else { arr[0].0 };
@@ -330,11 +352,6 @@ fn build_recurse(
         }
 
 if len < 3 { println!("Built leaf node with {} entries", len); }
-        // leaf marker
-        if !marked_as_leaf {
-            ctx.unmarked_leafs += 1;
-            push_number(&mut ctx.buf, Value::UnmarkedLeaf(len))?;
-        }
 
         return Ok(ctx.buf.len() as u64);
     }
@@ -342,7 +359,6 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
     /*
      * intermediate node
      */
-
 
     // split_point: find largest number that creates a tree with no empty pointers
     let mut split = 3;
@@ -358,13 +374,15 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
 
     assert!(left.len() >= 3);
     let left_is_leaf = left.len() == 3;
+    let right_is_leaf = right.len() == 3;
+    let unmarked_leaf = right_is_leaf && !left_is_leaf;
 
     // <own key> <left ptr> <own value> <right subtree> <left subtree>
     // built from back to front
     // left subtree
-    let left_ptr = build_recurse(ctx, left, own_key, left_is_leaf)?;
+    let left_ptr = build_recurse(ctx, left, own_key, false)?;
     // right subtree
-    let right_ptr = build_recurse(ctx, right, own_key, left_is_leaf)?;
+    let right_ptr = build_recurse(ctx, right, own_key, unmarked_leaf)?;
 
     // own value
     let n = push_number(&mut ctx.buf, Value::Val(own_value))?;
@@ -380,6 +398,7 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
         push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?
     };
     ctx.bytes_in_left_ptr += n;
+    ctx.num_left_ptr += 1;
     ctx.ptr_size_hist[(pos -left_ptr).leading_zeros() as usize] += 1;
 
     // own key
@@ -394,6 +413,7 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
     ctx.num_keys += 1;
     match n {
         1 => ctx.encoded_keys_len_1 += 1,
+        2 => ctx.encoded_keys_len_2 += 1,
         3 => ctx.encoded_keys_len_3 += 1,
         9 => ctx.encoded_keys_len_9 += 1,
         _ => panic!("Unexpected key length {}", n),
