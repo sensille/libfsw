@@ -112,6 +112,9 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
 //   DF   : followed by 8 bytes i64 (little-endian)
 //   E0-FF: lower 5 bits, followed by 2 bytes (little-endian)
 //
+// a ptr with value 0 is used to mark a leaf that is pointed to by a non-leaf ptr
+//   This can happen only for the last right child
+//
 // Maximum encodable table size is 256k
 //
 fn enc_rel_key(v: i64) -> Result<Vec<u8>> {
@@ -493,6 +496,93 @@ mod tests {
         Ok(())
     }
 
+    // find the entry with the largest key with key <= given key
+    // returns None if given key is smaller than the lowest key in the table
+    fn find_key_upper_bound(table: &[u8], search_key: u64) -> Result<Option<(u64, u64)>> {
+        // outline:
+        // start at root
+        // at each node, decode own key
+        //   if given key < own key, go to left child
+        //   else go to right child, recording own key as current best
+        let mut offset = 0;
+        let mut parent_key = 0i64;
+        let mut best = None;
+        let mut is_leaf = false;
+
+        loop {
+            let (mut current_key, advance) = dec_rel_key(&table[offset..])?;
+            offset += advance;
+            if current_key == 0 {
+                // dummy entry
+                return Ok(best);
+            }
+            current_key += parent_key;
+
+            if !is_leaf && is_leaf_marker(&table[offset..])? {
+//println!("Found unmarked leaf marker at offset {}", offset);
+                offset += 1;
+                is_leaf = true;
+            };
+
+            // intermediate node case
+            if !is_leaf {
+                let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
+                offset += advance;
+
+                parent_key = current_key;
+
+                if search_key < current_key as u64 {
+//println!("Going to left child at offset {} current_key {}", offset + left_ptr as usize, current_key);
+                    // go to left child
+                    offset += left_ptr as usize;
+                } else {
+                    let (current_val, advance) = dec_val(&table[offset..])?;
+                    offset += advance;
+                    best = Some((current_key as u64, current_val));
+                    // continue with right child
+//println!("Going to right child at offset {} with best {:?} current_key {}", offset, best, current_key);
+                }
+
+                is_leaf = left_is_leaf;
+                continue;
+            }
+
+//println!("At leaf node at offset {}", offset);
+            // leaf node case
+            let (left_key, advance) = dec_rel_key(&table[offset..])?;
+            offset += advance;
+            let (left_value, advance) = dec_val(&table[offset..])?;
+            offset += advance;
+//println!("Leaf keys: left_key {} ", left_key + current_key);
+
+            // own value
+            let (own_value, advance) = dec_val(&table[offset..])?;
+            offset += advance;
+
+            if search_key < current_key as u64 {
+                if left_key != 0 && search_key >= (left_key + current_key) as u64 {
+//    println!("Taking left key/value at leaf key {}", current_key + left_key);
+                        return Ok(Some(((left_key + current_key) as u64, left_value)));
+                }
+//println!("No suitable key found at leaf, returning best {:?}", best);
+                return Ok(best);
+            }
+
+            // right key/value
+            let (right_key, advance) = dec_rel_key(&table[offset..])?;
+            offset += advance;
+            let (right_value, _) = dec_val(&table[offset..])?;
+
+            if right_key != 0 && search_key >= (right_key + current_key) as u64 {
+//println!("Taking right key/value at leaf key {}", current_key + right_key);
+                return Ok(Some(((right_key + current_key) as u64, right_value)));
+            }
+
+//println!("Taking own key/value at leaf key {}", current_key);
+            return Ok(Some((current_key as u64, own_value)));
+        }
+    }
+
     fn build_test_table(seed: u64, sz: usize) -> Vec<(u64, u64)> {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
@@ -540,7 +630,7 @@ mod tests {
     #[test]
     fn large_test() {
         for n in 1..10000 {
-            let arr = build_test_table(3, n);
+            let arr = build_test_table(n, n as usize);
             let table = build(&arr).unwrap();
             println!("Built large table, size {}", table.len());
             let mut output = Vec::new();
@@ -578,22 +668,53 @@ mod tests {
             assert_eq!(arr, output);
         }
     }
+
     #[test]
-    fn test1() {
-        let arr = build_test_table(3, 16);
-        let table = build(&arr).unwrap();
-        println!("Built large table, size {}", table.len());
-        let mut output = Vec::new();
-        traverse_tree_recurse(&table, &mut output, 0, 0, false).unwrap();
-        for (i, v) in arr.iter().enumerate() {
-            println!("arr[{}] = {:?}", i, v);
+    fn test_find_key() {
+        let probes = 10000;
+        for table_size in 1..10000 {
+            println!("testing table size {}", table_size);
+            let arr = build_test_table(table_size, table_size as usize);
+            let table = build(&arr).unwrap();
+            let mut output = Vec::new();
+            traverse_tree_recurse(&table, &mut output, 0, 0, false).unwrap();
+            assert_eq!(arr, output);
+            /*
+            for (key, value) in arr.iter() {
+                println!("Table entry: key {} value {}", key, value);
+            }
+            */
+            for (key, value) in arr.iter() {
+                // exact match
+                //println!("Finding key {} value {}", key, value);
+                let res = find_key_upper_bound(&table, *key).unwrap();
+                //println!("  found {:?}", res);
+                assert!(res.is_some());
+                let (found_key, found_value) = res.unwrap();
+                assert_eq!(*key, found_key);
+                assert_eq!(*value, found_value);
+            }
+            let lowest_key = arr[0].0;
+            let highest_key = arr[arr.len() - 1].0;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+            for _ in 0..probes {
+                let key = rng.random_range(lowest_key.saturating_sub(1000)..=highest_key + 1000);
+                let res = find_key_upper_bound(&table, key).unwrap();
+                let expected = match arr.binary_search_by(|(k, _)| k.cmp(&key)) {
+                    Ok(idx) => Some(arr[idx]),
+                    Err(0) => None,
+                    Err(idx) => Some(arr[idx - 1]),
+                };
+                if expected.is_none() {
+                    assert!(res.is_none());
+                } else {
+                    let (exp_key, exp_value) = expected.unwrap();
+                    let (found_key, found_value) = res.unwrap();
+                    assert_eq!(exp_key, found_key);
+                    assert_eq!(exp_value, found_value);
+                }
+            }
         }
-        println!("---");
-        for (i, v) in table.iter().enumerate() {
-            println!("table[{}] = {:x?}", i, v);
-        }
-        assert_eq!(arr.len(), output.len());
-        assert_eq!(arr, output);
     }
 
     #[test]
