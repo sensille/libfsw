@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use crate::FswError;
 use crate::Result;
-use rand::prelude::*;
 
 /*
  * Table entry format:
@@ -36,6 +35,7 @@ struct BuildCtx {
     unmarked_leaves: usize,
 }
 
+// keys have to be sorted and strictly increasing
 pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     println!("Building table with {} entries", arr.len());
     /*
@@ -115,10 +115,9 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
 // Maximum encodable table size is 256k
 //
 fn enc_rel_key(v: i64) -> Result<Vec<u8>> {
-    let k =
     if v >= -111 && v <= 111 {
         Ok(Vec::from([(v + 111) as u8]))
-    } else if v >= -0x1fff && v <= 0x1fff {
+    } else if v >= -0x1000 && v < 0x1000 {
         let mut b = Vec::with_capacity(2);
         let v_u = v as u64;
         let b0 = 0xe0 | (((v_u >> 8 )as u8) & 0x1f);
@@ -131,9 +130,6 @@ fn enc_rel_key(v: i64) -> Result<Vec<u8>> {
         b.extend(&v.to_le_bytes());
         Ok(b)
     }
-    ;
-    println!("enc_rel_key({}) -> {:x?}", v, k);
-    k
 }
 
 #[cfg(test)]
@@ -142,7 +138,7 @@ fn dec_rel_key(b: &[u8]) -> Result<(i64, usize)> {
         return Err(FswError::TableValueDecodeError);
     }
     if b[0] <= 0xde {
-        Ok(((b[0] as i8 - 111) as i64, 1))
+        Ok(((b[0] as i64 - 111) as i64, 1))
     } else if b[0] == 0xdf {
         if b.len() < 9 {
             return Err(FswError::TableValueDecodeError);
@@ -351,7 +347,7 @@ fn build_recurse(
             push(&mut ctx.buf, enc_rel_key(0)?)?;
         }
 
-if len <= 3 { println!("Built leaf node with {} entries", len); }
+//if len <= 3 { println!("Built leaf node with {} entries unmarked {}", len, unmarked_leaf); }
 
         return Ok(ctx.buf.len() as u64);
     }
@@ -362,19 +358,19 @@ if len <= 3 { println!("Built leaf node with {} entries", len); }
 
     // split_point: find largest number that creates a tree with no empty pointers
     let mut split = 3;
-    while 2 * split + 1 + 2 <= len {
+    while 2 * split + 1 + 1 <= len {
         split = 2 * split + 1;
     }
     let left = &arr[..split];
     let right = &arr[split + 1..];
     let own_key = arr[split].0;
     let own_value = arr[split].1;
-    //println!("build_recurse: {} entries, split {} left len {} right len {}",
-    //   arr.len(), split, left.len(), right.len());
+//    println!("build_recurse: {} entries, split {} left len {} right len {} mid key {}",
+//       arr.len(), split, left.len(), right.len(), own_key);
 
     assert!(left.len() >= 3);
     let left_is_leaf = left.len() == 3;
-    let right_is_leaf = right.len() == 3;
+    let right_is_leaf = right.len() <= 3;
     let unmarked_leaf = right_is_leaf && !left_is_leaf;
 
     // <own key> <left ptr> <own value> <right subtree> <left subtree>
@@ -433,15 +429,17 @@ if len <= 3 { println!("Built leaf node with {} entries", len); }
 // tests
 #[cfg(test)]
 mod tests {
+    use rand::prelude::*;
     use super::*;
     use crate::Result;
-    fn traverse_tree_recurse(table: &Vec<u8>, mut offset: usize, parent_key: i64, mut is_leaf: bool)
+
+    fn traverse_tree_recurse(table: &Vec<u8>, output: &mut Vec<(u64, u64)>, mut offset: usize,
+        parent_key: i64, mut is_leaf: bool)
         -> Result<()>
     {
         let own_offset = offset;
         let (mut own_key, advance) = dec_rel_key(&table[offset..])?;
         own_key += parent_key;
-println!("key at offset {}: {:?}", offset, own_key);
         offset += advance;
 
         if !is_leaf {
@@ -456,25 +454,21 @@ println!("key at offset {}: {:?}", offset, own_key);
             offset += advance;
             let (left_value, advance) = dec_val(&table[offset..])?;
             offset += advance;
-            println!("Leaf at offset {}: left key {:?}, left value {:?}",
-                own_offset, own_key + left_key, left_value);
             if left_key != 0 {
-                println!("==> {} {}", own_key + left_key, left_value);
+                output.push(((own_key + left_key) as u64, left_value));
             }
             // own value
             let (own_value, advance) = dec_val(&table[offset..])?;
             offset += advance;
             if own_key != parent_key {
-                println!("==> {} {}", own_key, own_value);
+                output.push((own_key as u64, own_value));
             }
             // right key/value
             let (right_key, advance) = dec_rel_key(&table[offset..])?;
             offset += advance;
             let (right_value, _) = dec_val(&table[offset..])?;
-            println!("Leaf at offset {}: right key {:?}, right value {:?}",
-                own_offset, own_key + right_key, right_value);
             if right_key != 0 {
-                println!("==> {} {}", own_key + right_key, right_value);
+                output.push(((own_key + right_key) as u64, right_value));
             }
 
             return Ok(());
@@ -483,23 +477,18 @@ println!("key at offset {}: {:?}", offset, own_key);
         // intermediate node
         // left ptr
         let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
-        println!("left ptr at offset {}: {}, is_leaf {}", offset,
-            left_ptr, left_is_leaf);
         offset += advance;
 
         // descend into left child
-        traverse_tree_recurse(&table, offset + left_ptr as usize, own_key, left_is_leaf)?;
+        traverse_tree_recurse(&table, output, offset + left_ptr as usize, own_key, left_is_leaf)?;
 
         let (own_value, advance) = dec_val(&table[offset..])?;
-        println!("val at offset {}: {:?}", offset, own_value);
         offset += advance;
 
-        println!("Node at offset {}: key {:?}, value {:?}, left {:?}",
-            own_offset, own_key, own_value, left_ptr);
-        println!("==> {} {}", own_key, own_value);
+        output.push((own_key as u64, own_value));
 
         // descend into right child
-        traverse_tree_recurse(&table, offset, own_key, left_is_leaf)?;
+        traverse_tree_recurse(&table, output, offset, own_key, left_is_leaf)?;
 
         Ok(())
     }
@@ -508,13 +497,14 @@ println!("key at offset {}: {:?}", offset, own_key);
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
         let mut table = Vec::new();
-        let start_key = rng.random_range(0..1000000);
+        let mut start_key = rng.random_range(0..1000000);
         for _ in 0..sz {
             let key = if rng.random_range(0..500) == 0 {
                 start_key + rng.random_range(1..1000000)
             } else {
                 start_key + rng.random_range(1..1000)
             };
+            start_key = key;
             let value = rng.random_range(0..1000);
             table.push((key, value));
         }
@@ -531,20 +521,105 @@ println!("key at offset {}: {:?}", offset, own_key);
         arr.push((1012, 5));
         arr.push((1013, 6));
         arr.push((1014, 7));
+        arr.push((1200, 8));
+        arr.push((1202, 9));
+        arr.push((1205, 10));
+        arr.push((1206, 11));
+        arr.push((1208, 12));
         let table = build(&arr).unwrap();
         assert!(!table.is_empty());
         println!("Built table: {:?}", table);
         for (i, v) in table.iter().enumerate() {
             println!("{}: {:x?}", i, v);
         }
-        traverse_tree_recurse(&table, 0, 0, false).unwrap();
+        let mut output = Vec::new();
+        traverse_tree_recurse(&table, &mut output, 0, 0, false).unwrap();
+        assert_eq!(arr, output);
     }
 
     #[test]
     fn large_test() {
-        let arr = build_test_table(0, 10000);
+        for n in 1..10000 {
+            let arr = build_test_table(3, n);
+            let table = build(&arr).unwrap();
+            println!("Built large table, size {}", table.len());
+            let mut output = Vec::new();
+            traverse_tree_recurse(&table, &mut output, 0, 0, false).unwrap();
+            println!("traversed large table, {} entries", n);
+            if arr.len() != output.len() {
+                // find mismatches
+                let mut i = 0;
+                let mut j = 0;
+                while i < arr.len() && j < output.len() {
+                    if arr[i] == output[j] {
+                        i += 1;
+                        j += 1;
+                    } else {
+                        println!("mismatch: arr[{}] = {:?}, output[{}] = {:?}",
+                            i, arr[i], j, output[j]);
+                        if arr[i].0 < output[j].0 {
+                            i += 1;
+                        } else {
+                            j += 1;
+                        }
+                    }
+                }
+                while i < arr.len() {
+                    println!("extra in arr: arr[{}] = {:?}", i, arr[i]);
+                    i += 1;
+                }
+                while j < output.len() {
+                    println!("extra in output: output[{}] = {:?}", j, output[j]);
+                    j += 1;
+                }
+                println!("end of mismatches, i = {}, j = {}", i, j);
+            }
+            assert_eq!(arr.len(), output.len());
+            assert_eq!(arr, output);
+        }
+    }
+    #[test]
+    fn test1() {
+        let arr = build_test_table(3, 16);
         let table = build(&arr).unwrap();
         println!("Built large table, size {}", table.len());
-        traverse_tree_recurse(&table, 0, 0, false).unwrap();
+        let mut output = Vec::new();
+        traverse_tree_recurse(&table, &mut output, 0, 0, false).unwrap();
+        for (i, v) in arr.iter().enumerate() {
+            println!("arr[{}] = {:?}", i, v);
+        }
+        println!("---");
+        for (i, v) in table.iter().enumerate() {
+            println!("table[{}] = {:x?}", i, v);
+        }
+        assert_eq!(arr.len(), output.len());
+        assert_eq!(arr, output);
+    }
+
+    #[test]
+    fn test_key_encoding() {
+        for v in -200000..200000 {
+            let enc = enc_rel_key(v).unwrap();
+            let (dec, _) = dec_rel_key(&enc).unwrap();
+            assert_eq!(v, dec);
+        }
+    }
+
+    #[test]
+    fn test_ptr_encoding() {
+        for v in 0..262144 {
+            let enc = enc_rel_ptr(v).unwrap();
+            let (dec, _, _) = dec_rel_ptr(&enc).unwrap();
+            assert_eq!(v, dec);
+        }
+    }
+
+    #[test]
+    fn test_val_encoding() {
+        for v in 0..262144 {
+            let enc = enc_val(v).unwrap();
+            let (dec, _) = dec_val(&enc).unwrap();
+            assert_eq!(v, dec);
+        }
     }
 }

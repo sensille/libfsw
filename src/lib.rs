@@ -320,9 +320,10 @@ println!("expression: {:?}", expr);
                 right = mid - 1;
             }
         }
-        //let table = table::build(&arr[0..50000])?;
         println!("Final number of entries: {} after {} iterations", left, iterations);
         //println!("Final unwind table size: {}", table.len());
+
+        let table = table::build(&arr[0..50000])?;
         Err(NoEhInfo) // XXX
     }
 }
