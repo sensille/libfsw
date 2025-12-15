@@ -33,7 +33,7 @@ struct BuildCtx {
     encoded_keys_len_9: usize,
     leaf_ptrs: BTreeMap<u64, usize>,
     leaf_keys: [usize; 65],
-    unmarked_leafs: usize,
+    unmarked_leaves: usize,
 }
 
 pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
@@ -63,7 +63,7 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
         leaf_ptrs: BTreeMap::new(),
         leaf_keys: [0; 65],
         ptr_size_hist: [0; 65],
-        unmarked_leafs: 0,
+        unmarked_leaves: 0,
         num_values: 0,
         num_keys: 0,
         num_left_ptr: 0,
@@ -86,7 +86,7 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     println!("  leaf ptr size histogram: {:?}", ctx.leaf_ptrs);
     println!("  leaf key size histogram: {:?}", ctx.leaf_keys);
     println!("  ptr size histogram: {:?}", ctx.ptr_size_hist);
-    println!("  unmarked leafs: {}", ctx.unmarked_leafs);
+    println!("  unmarked leaves: {}", ctx.unmarked_leaves);
     println!("  total keys: {}", ctx.num_keys);
     println!("  total values: {}", ctx.num_values);
     println!("  total left ptrs: {}", ctx.num_left_ptr);
@@ -96,179 +96,168 @@ pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
     Ok(ctx.buf)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Value {
-    EmptyPtr,
-    RelKey(i64),
-    RelPtr(u64),
-    RelLeafPtr(u64),
-    Val(u64),
-    LeafMarker(usize),
-}
-
 //
 // encoding:
 // ptrs: we limit the table size to 2MB, so 21 bits
-//   00-f6: encode as 1 byte
-//   f7   : leaf marker
-//   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//   00-CF: encode as 1 byte
+//   D0-D8: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+// leaf ptrs:
+//   D8-DF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//   E0-FF: ptr as 1 byte
 // values:
 //   00-F7: encode as 1 byte
 //   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
 // RelKey:
-//   00-DA: 1 byte, val + 109
-//   DB   : leaf with 0 entries
-//   DC   : leaf with 1 entries
-//   DD   : leaf with 2 entries
-//   DE   : leaf with 3 entries
+//   00-DE: 1 byte, val + 111
 //   DF   : followed by 8 bytes i64 (little-endian)
 //   E0-FF: lower 5 bits, followed by 2 bytes (little-endian)
 //
-// PtrOrTailPtr:
-//  01-CF: ptr as 1 byte
-//  D0-D7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
-//  D8-DF: tail ptrs first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
-//  E0-FF: tail ptrs as 1 byte
-//
 // Maximum encodable table size is 256k
 //
-impl Value {
-    pub fn as_bytes(&self) -> Result<Vec<u8>> {
-        Ok(match self {
-            Value::RelKey(v) => {
-                if *v >= -111 && *v <= 111 {
-                    Vec::from([(*v + 111) as u8])
-                } else if *v >= -0x1fff && *v <= 0x1fff {
-                    let mut b = Vec::with_capacity(3);
-                    let v_u = *v as u64;
-                    let b0 = 0xe0 | ((v_u as u8) & 0x1f);
-                    b.push(b0);
-                    b.push((v_u & 0xff) as u8);
-                    //b.push(((v_u >> 8) & 0xff) as u8);
-                    b
-                } else {
-                    let mut b = Vec::with_capacity(9);
-                    b.push(0xff);
-                    b.extend(&v.to_le_bytes());
-                    b
-                }
-            }
-            Value::RelPtr(v) => {
-                if *v <= 0xce {
-                    Vec::from([*v as u8])
-                } else if *v <= 0x3ffff {
-                    let b0 = 0xd0 | (((*v >> 16) as u8) & 0x07);
-                    let b1 = (*v & 0xff) as u8;
-                    let b2 = ((*v >> 8) & 0xff) as u8;
-                    Vec::from([b0, b1, b2])
-                } else {
-println!("Value too large to encode: {:?}", self);
-                    return Err(FswError::TableValueEncodeError);
-                }
-            }
-            Value::RelLeafPtr(v) => {
-                if *v <= 0x1f {
-                    Vec::from([*v as u8 + 0xe0])
-                } else if *v <= 0x3ffff {
-println!("large tail ptr for value: {:?}", self);
-                    let b0 = 0xd8 | (((*v >> 16) as u8) & 0x07);
-                    let b1 = (*v & 0xff) as u8;
-                    let b2 = ((*v >> 8) & 0xff) as u8;
-                    Vec::from([b0, b1, b2])
-                } else {
-println!("Value too large to encode: {:?}", self);
-                    return Err(FswError::TableValueEncodeError);
-                }
-            }
-            Value::Val(v) => {
-                if *v <= 0xef {
-                    Vec::from([*v as u8])
-                } else if *v <= 0x3ffff {
-                    let b0 = 0xf0 | (((*v >> 16) as u8) & 0x07);
-                    let b1 = (*v & 0xff) as u8;
-                    let b2 = ((*v >> 8) & 0xff) as u8;
-                    Vec::from([b0, b1, b2])
-                } else {
-println!("Value too large to encode: {:?}", self);
-                    return Err(FswError::TableValueEncodeError);
-                }
-            }
-            Value::EmptyPtr => Vec::from([0x00]),
-            Value::LeafMarker(usize) => Vec::from([0x00, (*usize as u8)]),
-        })
+fn enc_rel_key(v: i64) -> Result<Vec<u8>> {
+    let k =
+    if v >= -111 && v <= 111 {
+        Ok(Vec::from([(v + 111) as u8]))
+    } else if v >= -0x1fff && v <= 0x1fff {
+        let mut b = Vec::with_capacity(2);
+        let v_u = v as u64;
+        let b0 = 0xe0 | (((v_u >> 8 )as u8) & 0x1f);
+        b.push(b0);
+        b.push((v_u & 0xff) as u8);
+        Ok(b)
+    } else {
+        let mut b = Vec::with_capacity(9);
+        b.push(0xdf);
+        b.extend(&v.to_le_bytes());
+        Ok(b)
     }
-//  E0-E7: ptr first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
-//  E8-EF: tail ptrs first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
-//  F0-FF: tail ptrs as 1 byte
-    pub fn read_rel_ptr(b: &[u8]) -> Result<(Value, usize)> {
-        let Some(v) = b.get(0) else {
-            return Err(FswError::TableValueDecodeError);
-        };
-        if *v == 0 {
-            Ok((Value::EmptyPtr, 1))
-        } else if *v < 0xe0 {
-            Ok((Value::RelPtr(*v as u64), 1))
-        } else if *v < 0xe8 {
-            let Some(b1) = b.get(1) else {
-                return Err(FswError::TableValueDecodeError);
-            };
-            let Some(b2) = b.get(2) else {
-                return Err(FswError::TableValueDecodeError);
-            };
-            let val = (((*v as u64 & 0x07) << 16) | ((*b2 as u64) << 8) | (*b1 as u64)) as u64;
-            Ok((Value::RelPtr(val), 3))
-        } else if *v < 0xf0 {
-            Ok((Value::RelPtr(*v as u64 & 0x0f), 1))
-        } else {
-            let Some(b1) = b.get(1) else {
-                return Err(FswError::TableValueDecodeError);
-            };
-            let Some(b2) = b.get(2) else {
-                return Err(FswError::TableValueDecodeError);
-            };
-            let val = (((*v as u64 & 0x07) << 16) | ((*b2 as u64) << 8) | (*b1 as u64)) as u64;
-            Ok((Value::RelLeafPtr(val), 3))
-        }
+    ;
+    println!("enc_rel_key({}) -> {:x?}", v, k);
+    k
+}
+
+#[cfg(test)]
+fn dec_rel_key(b: &[u8]) -> Result<(i64, usize)> {
+    if b.len() < 1 {
+        return Err(FswError::TableValueDecodeError);
     }
-    pub fn read_val(b: &[u8]) -> Result<(Value, usize)> {
-        let Some(v) = b.get(0) else {
+    if b[0] <= 0xde {
+        Ok(((b[0] as i8 - 111) as i64, 1))
+    } else if b[0] == 0xdf {
+        if b.len() < 9 {
             return Err(FswError::TableValueDecodeError);
-        };
-        if *v < 0xf8 {
-            Ok((Value::Val(*v as u64), 1))
-        } else {
-            let Some(b1) = b.get(1) else {
-                return Err(FswError::TableValueDecodeError);
-            };
-            let Some(b2) = b.get(2) else {
-                return Err(FswError::TableValueDecodeError);
-            };
-            let val = (((*v as u64 & 0x07) << 16) | ((*b2 as u64) << 8) | (*b1 as u64)) as u64;
-            Ok((Value::Val(val), 3))
         }
-    }
-    pub fn read_rel_key(b: &[u8]) -> Result<(Value, usize)> {
-        let Some(v) = b.get(0) else {
+        let key = i64::from_le_bytes(b[1..9].try_into().unwrap());
+        Ok((key, 9))
+    } else {
+        if b.len() < 2 {
             return Err(FswError::TableValueDecodeError);
-        };
-        if *v == 0xff {
-            if b.len() < 9 {
-                return Err(FswError::TableValueDecodeError);
-            }
-            let key = i64::from_le_bytes(b[1..9].try_into().unwrap());
-            Ok((Value::RelKey(key), 9))
-        } else {
-            let key = (*v as i8 - 120) as i64;
-            Ok((Value::RelKey(key), 1))
         }
+        let mut val = ((b[0] as u64 & 0x1f) << 8) | (b[1] as u64);
+        // sign extension
+        if val & 0x1000 != 0 {
+            val |= !0x1fff;
+        }
+
+        Ok((val as i64, 2))
     }
 }
 
-fn push_number(buf: &mut Vec<u8>, n: Value) -> Result<usize> {
-    let mut b = n.as_bytes()?;
-    let l = b.len();
-    b.reverse();
-    buf.extend(b);
+fn enc_rel_ptr(v: u64) -> Result<Vec<u8>> {
+    if v <= 0xcf {
+        Ok(Vec::from([v as u8]))
+    } else if v <= 0x3ffff {
+        let b0 = 0xd0 | (((v >> 16) as u8) & 0x07);
+        let b1 = (v & 0xff) as u8;
+        let b2 = ((v >> 8) & 0xff) as u8;
+        Ok(Vec::from([b0, b1, b2]))
+    } else {
+        Err(FswError::TableValueEncodeError)
+    }
+}
+
+fn enc_rel_leaf_ptr(v: u64) -> Result<Vec<u8>> {
+    if v <= 0x1f {
+        Ok(Vec::from([v as u8 + 0xe0]))
+    } else if v <= 0x3ffff {
+        let b0 = 0xd8 | (((v >> 16) as u8) & 0x07);
+        let b1 = (v & 0xff) as u8;
+        let b2 = ((v >> 8) & 0xff) as u8;
+        Ok(Vec::from([b0, b1, b2]))
+    } else {
+        Err(FswError::TableValueEncodeError)
+    }
+}
+
+fn enc_leaf_marker() -> Result<Vec<u8>> {
+    Ok(Vec::from([0x00]))
+}
+
+#[cfg(test)]
+fn is_leaf_marker(b: &[u8]) -> Result<bool> {
+    if b.len() < 1 {
+        return Err(FswError::TableValueDecodeError);
+    }
+    Ok(b[0] == 0x00)
+}
+
+#[cfg(test)]
+fn dec_rel_ptr(b: &[u8]) -> Result<(u64, bool, usize)> {
+    if b.len() < 1 {
+        return Err(FswError::TableValueDecodeError);
+    }
+    if b[0] <= 0xcf {
+        Ok((b[0] as u64, false, 1))
+    } else if b[0] <= 0xd7 {
+        if b.len() < 3 {
+            return Err(FswError::TableValueDecodeError);
+        }
+        let val = (((b[0] as u64 & 0x07) << 16) | ((b[2] as u64) << 8) | (b[1] as u64)) as u64;
+        Ok((val, false, 3))
+    } else if b[0] <= 0xdf {
+        if b.len() < 3 {
+            return Err(FswError::TableValueDecodeError);
+        }
+        let val = (((b[0] as u64 & 0x07) << 16) | ((b[2] as u64) << 8) | (b[1] as u64)) as u64;
+        Ok((val, true, 3))
+    } else {
+        Ok((b[0] as u64 & 0x1f, true, 1))
+    }
+}
+
+fn enc_val(v: u64) -> Result<Vec<u8>> {
+    if v <= 0xef {
+        Ok(Vec::from([v as u8]))
+    } else if v <= 0x3ffff {
+        let b0 = 0xf0 | (((v >> 16) as u8) & 0x07);
+        let b1 = (v & 0xff) as u8;
+        let b2 = ((v >> 8) & 0xff) as u8;
+        Ok(Vec::from([b0, b1, b2]))
+    } else {
+        Err(FswError::TableValueEncodeError)
+    }
+}
+
+#[allow(dead_code)]
+fn dec_val(b: &[u8]) -> Result<(u64, usize)> {
+    if b.len() < 1 {
+        return Err(FswError::TableValueDecodeError);
+    }
+    if b[0] <= 0xef {
+        Ok((b[0] as u64, 1))
+    } else {
+        if b.len() < 3 {
+            return Err(FswError::TableValueDecodeError);
+        }
+        let val = (((b[0] as u64 & 0x07) << 16) | ((b[2] as u64) << 8) | (b[1] as u64)) as u64;
+        Ok((val, 3))
+    }
+}
+
+fn push(buf: &mut Vec<u8>, mut n: Vec<u8>) -> Result<usize> {
+    let l = n.len();
+    n.reverse();
+    buf.extend(n);
     Ok(l)
 }
 
@@ -295,53 +284,74 @@ fn build_recurse(
      * leaf node
      */
     if len <= 3 {
-        // [<leaf marker>] <key> [<left key> <left value>] [<right key> <right value>] <own value>
+        // <key> [<leaf marker>] <left key> <left value> <own value> <right key> <right value>
+        // a key of 0 means the entry is not valid
         // emitted back to front
 
+        let own_key = match len {
+            3 => arr[1].0,
+            2 => arr[1].0,
+            1 => arr[0].0,
+            0 => parent_key,    // this entry is a dummy entry, choose it so it is 0
+            _ => unreachable!(),
+        };
+
+        // right key/value
+        if len == 3 {
+            let n = push(&mut ctx.buf, enc_val(arr[2].1)?)?;
+            ctx.bytes_in_values += n;
+            ctx.num_values += 1;
+            let n = push(&mut ctx.buf, enc_rel_key(arr[2].0 as i64 - own_key as i64)?)?;
+            ctx.bytes_in_keys += n;
+            ctx.num_keys += 1;
+        } else {
+            // dummy entry
+            push(&mut ctx.buf, enc_val(0)?)?;
+            push(&mut ctx.buf, enc_rel_key(0)?)?;
+        }
 
         // own value
         if len > 0 {
             let own_val = if len >= 2 { arr[1].1 } else { arr[0].1 };
-            let n = push_number(&mut ctx.buf, Value::Val(own_val))?;
+            let n = push(&mut ctx.buf, enc_val(own_val)?)?;
             ctx.bytes_in_values += n;
             ctx.num_values += 1;
-        }
-
-        // right key/value
-        if len == 3 {
-            let n = push_number(&mut ctx.buf, Value::Val(arr[2].1))?;
-            ctx.bytes_in_values += n;
-            ctx.num_values += 1;
-            let n = push_number(&mut ctx.buf, Value::RelKey(parent_key as i64 - arr[2].0 as i64))?;
-            ctx.bytes_in_keys += n;
-            ctx.num_keys += 1;
+        } else {
+            // dummy entry
+            push(&mut ctx.buf, enc_val(0)?)?;
         }
 
         // left key/value
         if len >= 2 {
-            let n = push_number(&mut ctx.buf, Value::Val(arr[0].1))?;
+            let n = push(&mut ctx.buf, enc_val(arr[0].1)?)?;
             ctx.bytes_in_values += n;
             ctx.num_values += 1;
-            let n = push_number(&mut ctx.buf, Value::RelKey(parent_key as i64 - arr[0].0 as i64))?;
+            let n = push(&mut ctx.buf, enc_rel_key(arr[0].0 as i64 - own_key as i64)?)?;
             ctx.bytes_in_keys += n;
             ctx.num_keys += 1;
+        } else {
+            // dummy entry
+            push(&mut ctx.buf, enc_val(0)?)?;
+            push(&mut ctx.buf, enc_rel_key(0)?)?;
         }
 
         // leaf marker
         if unmarked_leaf {
-            ctx.unmarked_leafs += 1;
-            push_number(&mut ctx.buf, Value::LeafMarker(len))?;
+            ctx.unmarked_leaves += 1;
+            push(&mut ctx.buf, enc_leaf_marker()?)?;
         }
 
         // own key
         if len >= 1 {
-            let own_key = if len >= 2 { arr[1].0 } else { arr[0].0 };
-            let n = push_number(&mut ctx.buf, Value::RelKey(parent_key as i64 - own_key as i64))?;
+            let n = push(&mut ctx.buf, enc_rel_key(own_key as i64 - parent_key as i64)?)?;
             ctx.bytes_in_keys += n;
             ctx.num_keys += 1;
+        } else {
+            // dummy entry
+            push(&mut ctx.buf, enc_rel_key(0)?)?;
         }
 
-if len < 3 { println!("Built leaf node with {} entries", len); }
+if len <= 3 { println!("Built leaf node with {} entries", len); }
 
         return Ok(ctx.buf.len() as u64);
     }
@@ -375,7 +385,7 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
     let right_ptr = build_recurse(ctx, right, own_key, unmarked_leaf)?;
 
     // own value
-    let n = push_number(&mut ctx.buf, Value::Val(own_value))?;
+    let n = push(&mut ctx.buf, enc_val(own_value)?)?;
     ctx.bytes_in_values += n;
     ctx.num_values += 1;
 
@@ -383,9 +393,9 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
     let pos = ctx.buf.len() as u64;
     let n = if left_is_leaf {
         *ctx.leaf_ptrs.entry(pos - right_ptr).or_insert(0) += 1;
-        push_number(&mut ctx.buf, Value::RelLeafPtr(pos - left_ptr))?
+        push(&mut ctx.buf, enc_rel_leaf_ptr(pos - left_ptr)?)?
     } else {
-        push_number(&mut ctx.buf, Value::RelPtr(pos - left_ptr))?
+        push(&mut ctx.buf, enc_rel_ptr(pos - left_ptr)?)?
     };
     ctx.bytes_in_left_ptr += n;
     ctx.num_left_ptr += 1;
@@ -398,7 +408,7 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
     } else {
         ctx.key_size_hist_neg[rel_key.leading_ones() as usize] += 1;
     };
-    let n = push_number(&mut ctx.buf, Value::RelKey(rel_key))?;
+    let n = push(&mut ctx.buf, enc_rel_key(rel_key)?)?;
     ctx.bytes_in_keys += n;
     ctx.num_keys += 1;
     match n {
@@ -425,30 +435,72 @@ if len < 3 { println!("Built leaf node with {} entries", len); }
 mod tests {
     use super::*;
     use crate::Result;
-    fn traverse_tree_recurse(table: &Vec<u8>, mut offset: usize, parent_key: i64)
+    fn traverse_tree_recurse(table: &Vec<u8>, mut offset: usize, parent_key: i64, mut is_leaf: bool)
         -> Result<()>
     {
         let own_offset = offset;
-        let (Value::RelKey(mut own_key), advance) = Value::read_rel_key(&table[offset..])? else {
-            panic!("Expected RelKey at offset {}", offset);
-        };
+        let (mut own_key, advance) = dec_rel_key(&table[offset..])?;
         own_key += parent_key;
+println!("key at offset {}: {:?}", offset, own_key);
         offset += advance;
-        let (left_ptr, advance) = Value::read_rel_ptr(&table[offset..])?;
-        offset += advance;
-        let left_offset = offset;
-        let (right_ptr, advance) = Value::read_rel_ptr(&table[offset..])?;
-        offset += advance;
-        let right_offset = offset;
-        let (own_value, _) = Value::read_val(&table[offset..])?;
-        if let Value::RelPtr(ptr) = left_ptr {
-            traverse_tree_recurse(&table, left_offset + ptr as usize, own_key)?;
+
+        if !is_leaf {
+            if is_leaf_marker(&table[offset..])? {
+                offset += 1;
+                is_leaf = true;
+            }
         }
-        println!("Node at offset {}: key {:?}, value {:?}, left {:?}, right {:?}",
-            own_offset, own_key, own_value, left_ptr, right_ptr);
-        if let Value::RelPtr(ptr) = right_ptr {
-            traverse_tree_recurse(&table, right_offset + ptr as usize, own_key)?;
+
+        if is_leaf {
+            let (left_key, advance) = dec_rel_key(&table[offset..])?;
+            offset += advance;
+            let (left_value, advance) = dec_val(&table[offset..])?;
+            offset += advance;
+            println!("Leaf at offset {}: left key {:?}, left value {:?}",
+                own_offset, own_key + left_key, left_value);
+            if left_key != 0 {
+                println!("==> {} {}", own_key + left_key, left_value);
+            }
+            // own value
+            let (own_value, advance) = dec_val(&table[offset..])?;
+            offset += advance;
+            if own_key != parent_key {
+                println!("==> {} {}", own_key, own_value);
+            }
+            // right key/value
+            let (right_key, advance) = dec_rel_key(&table[offset..])?;
+            offset += advance;
+            let (right_value, _) = dec_val(&table[offset..])?;
+            println!("Leaf at offset {}: right key {:?}, right value {:?}",
+                own_offset, own_key + right_key, right_value);
+            if right_key != 0 {
+                println!("==> {} {}", own_key + right_key, right_value);
+            }
+
+            return Ok(());
         }
+
+        // intermediate node
+        // left ptr
+        let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
+        println!("left ptr at offset {}: {}, is_leaf {}", offset,
+            left_ptr, left_is_leaf);
+        offset += advance;
+
+        // descend into left child
+        traverse_tree_recurse(&table, offset + left_ptr as usize, own_key, left_is_leaf)?;
+
+        let (own_value, advance) = dec_val(&table[offset..])?;
+        println!("val at offset {}: {:?}", offset, own_value);
+        offset += advance;
+
+        println!("Node at offset {}: key {:?}, value {:?}, left {:?}",
+            own_offset, own_key, own_value, left_ptr);
+        println!("==> {} {}", own_key, own_value);
+
+        // descend into right child
+        traverse_tree_recurse(&table, offset, own_key, left_is_leaf)?;
+
         Ok(())
     }
 
@@ -485,14 +537,14 @@ mod tests {
         for (i, v) in table.iter().enumerate() {
             println!("{}: {:x?}", i, v);
         }
-        traverse_tree_recurse(&table, 0, 0).unwrap();
+        traverse_tree_recurse(&table, 0, 0, false).unwrap();
     }
 
     #[test]
-    fn test_build_large() {
+    fn large_test() {
         let arr = build_test_table(0, 10000);
         let table = build(&arr).unwrap();
         println!("Built large table, size {}", table.len());
-        traverse_tree_recurse(&table, 0, 0).unwrap();
+        traverse_tree_recurse(&table, 0, 0, false).unwrap();
     }
 }
