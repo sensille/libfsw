@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use crate::FswError;
 use crate::Result;
+use rand::prelude::*;
 
 /*
  * Table entry format:
@@ -136,18 +137,7 @@ impl Value {
         Ok(match self {
             Value::RelKey(v) => {
                 if *v >= -111 && *v <= 111 {
-                //if *v >= -109 && *v <= 109 {
-                    Vec::from([(*v as i8 + 109) as u8])
-                        /*
-                } else if *v >= -0x1f_ffff && *v <= 0x1f_ffff {
-                    let mut b = Vec::with_capacity(3);
-                    let v_u = *v as u64;
-                    let b0 = 0xe0 | ((v_u as u8) & 0x1f);
-                    b.push(b0);
-                    b.push((v_u & 0xff) as u8);
-                    b.push(((v_u >> 8) & 0xff) as u8);
-                    b
-                        */
+                    Vec::from([(*v + 111) as u8])
                 } else if *v >= -0x1fff && *v <= 0x1fff {
                     let mut b = Vec::with_capacity(3);
                     let v_u = *v as u64;
@@ -462,6 +452,23 @@ mod tests {
         Ok(())
     }
 
+    fn build_test_table(seed: u64, sz: usize) -> Vec<(u64, u64)> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+        let mut table = Vec::new();
+        let start_key = rng.random_range(0..1000000);
+        for _ in 0..sz {
+            let key = if rng.random_range(0..500) == 0 {
+                start_key + rng.random_range(1..1000000)
+            } else {
+                start_key + rng.random_range(1..1000)
+            };
+            let value = rng.random_range(0..1000);
+            table.push((key, value));
+        }
+        table
+    }
+
     #[test]
     fn test_build() {
         let mut arr = Vec::new();
@@ -478,6 +485,14 @@ mod tests {
         for (i, v) in table.iter().enumerate() {
             println!("{}: {:x?}", i, v);
         }
+        traverse_tree_recurse(&table, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn test_build_large() {
+        let arr = build_test_table(0, 10000);
+        let table = build(&arr).unwrap();
+        println!("Built large table, size {}", table.len());
         traverse_tree_recurse(&table, 0, 0).unwrap();
     }
 }
