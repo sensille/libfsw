@@ -280,10 +280,11 @@ println!("Adding file: {} result {:?}", map.file_path, res);
     }
 
     pub fn build_unwind_tables(&mut self)
-        -> Result<(Vec<Vec<u8>>, Vec<(u16, u64, usize, u32)>)>
+        -> Result<(Vec<Vec<u8>>, Vec<(usize, u64, usize, usize)>)>
     {
         let mut tables = Vec::new();
         let mut mappings = Vec::new();
+        let chunk_size = 256 * 1024; // 256 KB per eBPF map entry
 
         // count occurences of unwind entries and sort them in descending order, so that
         // the entries with the highest occurences get the lowest ids for a smaller encoding
@@ -297,6 +298,8 @@ println!("Adding file: {} result {:?}", map.file_path, res);
             entry_id_map[*old_id] = new_id;
         }
 
+        let mut current_table = Vec::new();
+        let mut current_table_id = 0;
         for (oid, unwind_table) in self.unwind_tables.iter().enumerate() {
             // convert unwind table to arr with u64 -> u64
             let mut arr = Vec::with_capacity(unwind_table.len());
@@ -310,18 +313,35 @@ println!("Adding file: {} result {:?}", map.file_path, res);
             //println!("Final unwind table size: {}", table.len());
 
             let mut start = 0;
-            let mut total_size = 0;
-            let mut part = 0;
             while arr.len() > start {
-                let (table, entries) = table::build(&arr[start..], 256 * 1024)?;
+                let sz = chunk_size - current_table.len() - 0; // leave some space to relax bounds
+                                                                // checks in eBPF
+                let (table, entries) = table::build(&arr[start..], sz)?;
+println!("add mapping: oid {} addr {:x} table id {} offset {}",
+oid, arr[start].0, current_table_id, current_table.len());
+                mappings.push((oid, arr[start].0, current_table_id, current_table.len()));
+                if current_table.is_empty() {
+                    current_table = table;
+                } else {
+                    current_table.extend_from_slice(&table);
+                }
+                if current_table.len() >= chunk_size - 200 {
+                    tables.push(current_table);
+                    current_table = Vec::new();
+                    current_table_id += 1;
+                }
                 start += entries;
-                total_size += table.len();
-                part += 1;
             }
-            println!("Final unwind table size: {} in {} parts", total_size, part);
-            mappings.push((oid as u16, 0, 0, 0)); // TODO
-            tables.push(Vec::new());
         }
+
+        if !current_table.is_empty() {
+            tables.push(current_table);
+        }
+        println!("Final unwind table size: {} in {} parts",
+            tables.iter().map(|t| t.len()).sum::<usize>(), tables.len());
+        println!("Total .eh_frame size: {}", self.total_eh_frame_size);
+        println!("Total unwind entries: {}",
+            self.unwind_tables.iter().map(|u| u.len()).sum::<usize>());
 
         Ok((tables, mappings))
     }
