@@ -2,6 +2,7 @@ use object::{Object, ObjectSection};
 use gimli::{ UnwindSection, Register };
 use thiserror::Error;
 use std::collections::{ HashMap, BTreeMap, BTreeSet };
+use log::{ debug, info, warn };
 
 mod table;
 
@@ -23,8 +24,8 @@ pub enum FswError {
     GimliError(gimli::Error),
     #[error("CIE missing for FDE")]
     MissingCie,
-    #[error("OID too large, needs to fit in 16 bits")]
-    OidTooLarge,
+    #[error("Object table is full")]
+    TooManyObjects,
     #[error("Can't encode table value")]
     TableValueEncodeError,
     #[error("Can't encode table ptr")]
@@ -74,18 +75,18 @@ struct EvaluationContext {
 
 #[derive(Debug)]
 pub struct Fsw {
-    unwind_table: BTreeMap<(usize, u64), Option<usize>>,
+    unwind_tables: Vec<BTreeMap<u64, Option<usize>>>,
     unwind_entries: BTreeMap<usize, UnwindEntry>,
+    unwind_entry_counts: Vec<usize>,
     unwind_entries_rev: BTreeMap<UnwindEntry, usize>,
     maps: BTreeMap<u64, EvaluationContext>, // XXX
     expressions: BTreeMap<usize, Vec<u8>>,
     expressions_rev: BTreeMap<Vec<u8>, usize>,
-    parsing_errors: HashMap<ParsingError, u64>,
-    next_entry_id: usize,
+    total_eh_frame_size: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-enum ParsingError {
+pub enum ParsingError {
     NoError,
     BadExpressionOffset,
     UnknownRegisterRule,
@@ -95,23 +96,24 @@ enum ParsingError {
 impl Fsw {
     pub fn new() -> Self {
         Fsw {
-            unwind_table: BTreeMap::new(),
+            unwind_tables: Vec::new(),
             unwind_entries: BTreeMap::new(),
             unwind_entries_rev: BTreeMap::new(),
+            unwind_entry_counts: Vec::new(),
             maps: BTreeMap::new(),
             expressions: BTreeMap::new(),
             expressions_rev: BTreeMap::new(),
-            parsing_errors: HashMap::new(),
-            next_entry_id: 1,
+            total_eh_frame_size: 0,
         }
     }
 
     // oid object id must be unique
-    pub fn add_file<P: AsRef<std::path::Path>>(&mut self, path: P, oid: usize)
-        -> Result<()>
-    {
-        if oid > 0xffff {
-            return Err(OidTooLarge);
+    pub fn add_file<P: AsRef<std::path::Path>>(&mut self, path: P)
+        -> Result<(u16, HashMap<ParsingError, u64>)>
+    { 
+        let oid = self.unwind_tables.len() as u16;
+        if oid == u16::MAX {
+            return Err(TooManyObjects);
         }
         let file = std::fs::File::open(path).map_err(FileOpenError)?;
 
@@ -122,8 +124,11 @@ impl Fsw {
             .section_by_name(".eh_frame")
             .ok_or(NoEhInfo)?;
 
+        let mut unwind_table = BTreeMap::new();
+        let mut parsing_errors = HashMap::new();
         let eh_frame_data = eh_frame_section.uncompressed_data().map_err(ObjectParseError)?;
-println!("Parsing .eh_frame of size {}", eh_frame_data.len());
+        debug!("Parsing .eh_frame of size {}", eh_frame_data.len());
+        self.total_eh_frame_size += eh_frame_data.len();
         let eh_frame = gimli::EhFrame::new(&eh_frame_data, gimli::NativeEndian);
         let bases = gimli::BaseAddresses::default()
             .set_eh_frame(eh_frame_section.address());
@@ -208,12 +213,13 @@ println!("Parsing .eh_frame of size {}", eh_frame_data.len());
                         };
                         // get row index or create new
                         let entryid = if let Some(id) = self.unwind_entries_rev.get(&entry) {
+                            self.unwind_entry_counts[*id] += 1;
                             *id
                         } else {
-                            let id = self.next_entry_id;
-                            self.next_entry_id += 1;
+                            let id = self.unwind_entries.len();
                             self.unwind_entries.insert(id, entry.clone());
                             self.unwind_entries_rev.insert(entry, id);
+                            self.unwind_entry_counts.push(1);
                             id
                         };
                         // start may override end
@@ -221,26 +227,29 @@ println!("Parsing .eh_frame of size {}", eh_frame_data.len());
                         // end overrides nothing
                         let start = row.start_address();
                         let end = row.end_address();
-                        if let Some(Some(_)) = self.unwind_table.get(&(oid, start)) {
+                        if let Some(Some(_)) = unwind_table.get(&start) {
                             error = ParsingError::RowOverlap;
                             break 'rows;
                         }
-                        self.unwind_table.insert((oid, start), Some(entryid));
-                        if self.unwind_table.get(&(oid, end)).is_none() {
-                            self.unwind_table.insert((oid, end), None);
+                        unwind_table.insert(start, Some(entryid));
+                        if unwind_table.get(&end).is_none() {
+                            unwind_table.insert(end, None);
                         }
                     }
                     if error != ParsingError::NoError {
-                        *self.parsing_errors.entry(error).or_default() += 1;
+                        *parsing_errors.entry(error).or_default() += 1;
                     }
                 }
             }
         }
-        println!("Parsing errors: {:?}", self.parsing_errors);
-        println!("Unwind entries: {}", self.unwind_entries.len());
-        println!("Unwind table  : {}", self.unwind_table.len());
-        println!("Expressions   : {}", self.expressions.len());
-        Ok(())
+        warn!("Parsing errors: {:?}", parsing_errors);
+        info!("Unwind entries: {}", self.unwind_entries.len());
+        info!("Unwind table  : {}", unwind_table.len());
+        info!("Expressions   : {}", self.expressions.len());
+
+        self.unwind_tables.push(unwind_table);
+
+        Ok((oid, parsing_errors))
     }
 
     pub fn add_pid(&mut self, pid: u32) -> Result<()> {
@@ -250,9 +259,8 @@ println!("Parsing .eh_frame of size {}", eh_frame_data.len());
             if seen.contains(&map.file_path) {
                 continue;
             }
-            let oid = seen.len();
             seen.insert(map.file_path.clone());
-            let res = self.add_file(&map.file_path, oid);
+            let res = self.add_file(&map.file_path);
 println!("Adding file: {} result {:?}", map.file_path, res);
         }
 
@@ -260,7 +268,7 @@ println!("Adding file: {} result {:?}", map.file_path, res);
     }
 
     fn add_expression(&mut self, expr: Vec<u8>) -> usize {
-println!("expression: {:?}", expr);
+        debug!("expression: {:?}", expr);
         if let Some(id) = self.expressions_rev.get(&expr) {
             *id
         } else {
@@ -271,54 +279,51 @@ println!("expression: {:?}", expr);
         }
     }
 
-    pub fn build_table(&mut self) -> Result<()> {
-        // sort unwind entries by occurences
-        let mut entry_counts = HashMap::new();
-        // count occurences
-        for entry_opt in self.unwind_table.values() {
-            if let Some(entry_id) = entry_opt {
-                *entry_counts.entry(*entry_id).or_default() += 1;
+    pub fn build_unwind_tables(&mut self)
+        -> Result<(Vec<Vec<u8>>, Vec<(u16, u64, usize, u32)>)>
+    {
+        let mut tables = Vec::new();
+        let mut mappings = Vec::new();
+
+        // count occurences of unwind entries and sort them in descending order, so that
+        // the entries with the highest occurences get the lowest ids for a smaller encoding
+        let mut by_count: Vec<(usize, usize)> = self.unwind_entry_counts.iter().enumerate()
+            .map(|(i, c)| (i, *c)).collect();
+        by_count.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // build map from old entry id to new entry id
+        let mut entry_id_map = vec![0; by_count.len()];
+        for (new_id, (old_id, _count)) in by_count.iter().enumerate() {
+            entry_id_map[*old_id] = new_id;
+        }
+
+        for (oid, unwind_table) in self.unwind_tables.iter().enumerate() {
+            // convert unwind table to arr with u64 -> u64
+            let mut arr = Vec::with_capacity(unwind_table.len());
+            for (addr, entry_opt) in unwind_table {
+                let entry_id = match entry_opt {
+                    Some(eid) => *entry_id_map.get(*eid).unwrap() + 1, // entry ids start at 1
+                    None => 0,                                        // 0 means end of unwind info
+                };
+                arr.push((*addr, entry_id as u64));
             }
-        }
-        // convert to vec and sort
-        let mut by_count: Vec<(usize, usize)> = entry_counts.into_iter().collect();
-        by_count.sort_by(|a, b| {
-            match b.1.cmp(&a.1) {
-                std::cmp::Ordering::Equal => a.0.cmp(&b.0),
-                x => x,
+            //println!("Final unwind table size: {}", table.len());
+
+            let mut start = 0;
+            let mut total_size = 0;
+            let mut part = 0;
+            while arr.len() > start {
+                let (table, entries) = table::build(&arr[start..], 256 * 1024)?;
+                start += entries;
+                total_size += table.len();
+                part += 1;
             }
-        }); // descending
-
-        // build mapping from old entry id to new entry id
-        let mut entry_id_map = HashMap::new();
-        for (i, (e, _)) in by_count.iter().enumerate() {
-            entry_id_map.insert(*e as usize, i + 1); // new ids start at 1
+            println!("Final unwind table size: {} in {} parts", total_size, part);
+            mappings.push((oid as u16, 0, 0, 0)); // TODO
+            tables.push(Vec::new());
         }
 
-        // convert to arr with u64 -> u64
-        let mut arr = Vec::with_capacity(self.unwind_table.len());
-        for ((oid, addr), entry_opt) in &self.unwind_table {
-            assert!(*oid < 0xffff);
-            let entry_id = match entry_opt {
-                Some(eid) => *entry_id_map.get(eid).unwrap(),
-                None => 0,
-            };
-            let key = ((*oid as u64) << 48) | *addr;
-            arr.push((key, entry_id as u64));
-        }
-        //println!("Final unwind table size: {}", table.len());
-
-        let mut start = 0;
-        let mut total_size = 0;
-        let mut part = 0;
-        while arr.len() > start {
-            let (table, entries) = table::build(&arr[start..], 256 * 1024)?;
-            start += entries;
-            total_size += table.len();
-            part += 1;
-        }
-        println!("Final unwind table size: {} in {} parts", total_size, part);
-        Err(NoEhInfo) // XXX
+        Ok((tables, mappings))
     }
 }
 
