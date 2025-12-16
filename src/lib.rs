@@ -27,8 +27,12 @@ pub enum FswError {
     OidTooLarge,
     #[error("Can't encode table value")]
     TableValueEncodeError,
+    #[error("Can't encode table ptr")]
+    TablePtrEncodeError,
     #[error("Can't decode table value")]
     TableValueDecodeError,
+    #[error("Table build error")]
+    TableBuildError,
 
 }
 use FswError::*;
@@ -278,7 +282,12 @@ println!("expression: {:?}", expr);
         }
         // convert to vec and sort
         let mut by_count: Vec<(usize, usize)> = entry_counts.into_iter().collect();
-        by_count.sort_by(|a, b| b.1.cmp(&a.1)); // descending
+        by_count.sort_by(|a, b| {
+            match b.1.cmp(&a.1) {
+                std::cmp::Ordering::Equal => a.0.cmp(&b.0),
+                x => x,
+            }
+        }); // descending
 
         // build mapping from old entry id to new entry id
         let mut entry_id_map = HashMap::new();
@@ -297,33 +306,18 @@ println!("expression: {:?}", expr);
             let key = ((*oid as u64) << 48) | *addr;
             arr.push((key, entry_id as u64));
         }
-        // try to fit as many entries as possible into 256k
-        let mut target_len = 2 * 256 * 1024;
-        let mut left = target_len / 12;
-        let mut right = target_len / 2;
-        let mut iterations = 0;
-        while left < right {
-            iterations += 1;
-            let mid = (left + right + 1) / 2;
-            println!("left {}, right {}, mid {}", left, right, mid);
-            let table = match table::build(&arr[0..mid]) {
-                Ok(t) => t,
-                Err(_) => {
-                    right = mid - 1;
-                    continue;
-                }
-            };
-            println!("  built table of size {}", table.len());
-            if table.len() <= target_len {
-                left = mid;
-            } else {
-                right = mid - 1;
-            }
-        }
-        println!("Final number of entries: {} after {} iterations", left, iterations);
         //println!("Final unwind table size: {}", table.len());
 
-        let table = table::build(&arr[0..50000])?;
+        let mut start = 0;
+        let mut total_size = 0;
+        let mut part = 0;
+        while arr.len() > start {
+            let (table, entries) = table::build(&arr[start..], 256 * 1024)?;
+            start += entries;
+            total_size += table.len();
+            part += 1;
+        }
+        println!("Final unwind table size: {} in {} parts", total_size, part);
         Err(NoEhInfo) // XXX
     }
 }

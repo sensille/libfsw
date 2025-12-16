@@ -2,6 +2,8 @@ use anyhow::Result;
 use libfsw::Fsw;
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     let mut fsw = Fsw::new();
     fsw.add_file("../fswutil/ceph-osd", 501)?;
     fsw.build_table()?;

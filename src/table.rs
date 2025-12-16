@@ -1,17 +1,10 @@
 use crate::FswError;
 use crate::Result;
+use log::{ debug, trace, info };
 
-/*
- * Table entry format:
- *     own key
- *     left child ptr
- *     right child ptr
- *     own value
- *   key is relative to parent key
- *   ptrs are offsets from end of current entry
- */
+#[derive(Default)]
 struct BuildCtx {
-    buf: Vec<u8>,       // built up from back to front
+    buf: Vec<u8>,       // resulting table in reverse order
     bytes_in_values: usize,
     bytes_in_ptr: usize,
     bytes_in_keys: usize,
@@ -19,28 +12,86 @@ struct BuildCtx {
 }
 
 // keys have to be sorted and strictly increasing
-pub(crate) fn build(arr: &[(u64, u64)]) -> Result<Vec<u8>> {
-    println!("Building table with {} entries", arr.len());
-    let mut ctx = BuildCtx {
-        buf: Vec::new(),
-        bytes_in_values: 0,
-        bytes_in_ptr: 0,
-        bytes_in_keys: 0,
-        unmarked_leaves: 0,
-    };
-    build_recurse(&mut ctx, arr, 0, true)?;
+pub(crate) fn build(arr: &[(u64, u64)], max_size: usize) -> Result<(Vec<u8>, usize)> {
+    debug!("Building table with {} entries into {} bytes", arr.len(), max_size);
 
-    println!("Built table, size {} bytes", ctx.buf.len());
-    println!("  bytes in keys: {}", ctx.bytes_in_keys);
-    println!("  bytes in ptrs: {}", ctx.bytes_in_ptr);
-    println!("  bytes in values: {}", ctx.bytes_in_values);
-    println!("  unmarked leaves: {}", ctx.unmarked_leaves);
+    let mut entries = ((max_size as f64 / 2.6) as usize).min(arr.len());
+    let mut left = 1;
+    let mut right = arr.len();
+    let mut result = None;
+
+    while left < right {
+        let mut ctx = BuildCtx { ..Default::default() };
+        debug!("Trying with {} entries, left {} right {}", entries, left, right);
+        match build_recurse(&mut ctx, &arr[..entries], 0, true) {
+            Ok(_) => {},
+            Err(FswError::TablePtrEncodeError) => {},
+            Err(e) => return Err(e),
+        }
+        let diff = ctx.buf.len() as f64 - max_size as f64;
+        debug!(" size {} diff {} bytes", ctx.buf.len(), diff);
+        let adj = (diff.abs() / 2.6).max(1.0) as usize;
+        if ctx.buf.len() > max_size {
+            right = entries - 1;
+            entries = (entries - adj).max(left);
+        } else {
+            left = entries;
+            entries = (entries + adj).min(right);
+            result = Some((ctx, entries));
+            if diff.abs() < 16.0 {
+                break;
+            }
+        }
+        debug!("setting {} entries, left {} right {}", entries, left, right);
+    }
+
+    let Some((mut ctx, entries)) = result else {
+        return Err(FswError::TableBuildError);
+    };
+    info!("Built table, size {} bytes", ctx.buf.len());
+    info!("  bytes in keys: {}", ctx.bytes_in_keys);
+    info!("  bytes in ptrs: {}", ctx.bytes_in_ptr);
+    info!("  bytes in values: {}", ctx.bytes_in_values);
+    info!("  unmarked leaves: {}", ctx.unmarked_leaves);
+    info!("  entries: {}", entries);
 
     ctx.buf.reverse();
 
-    Ok(ctx.buf)
+    Ok((ctx.buf, entries))
 }
 
+//
+//  Table entry format:
+//      own key
+//      left child ptr or leaf marker
+//      own value
+//      right subtree
+//      left subtree
+//
+//   key is relative to parent key
+//   ptrs are offsets from end of current entry
+//   a pointer marks whether it points to a leaf or not
+//
+//   leaf node format:
+//      own key
+//      left key
+//      left value
+//      own value
+//      right key
+//      right value
+//
+//   The tree can have one leaf in the tree that is not pointed to by a ptr,
+//   thus not explicitly marked as leaf. If present, this is always the rightmost
+//   leaf in the tree. All other leaves are full.
+//
+//   incomplete leaf format;
+//      own key       (0 for empty leaf)
+//      leaf marker   (can be distinguished from ptrs)
+//      left key      (0 if no left entry)
+//      left value
+//      own value
+//      right key     (0 if no right entry)
+//      right value
 //
 // encoding:
 // ptrs: we limit the table size to 2MB, so 21 bits
@@ -116,7 +167,7 @@ fn enc_rel_ptr(v: u64) -> Result<Vec<u8>> {
         let b2 = ((v >> 8) & 0xff) as u8;
         Ok(Vec::from([b0, b1, b2]))
     } else {
-        Err(FswError::TableValueEncodeError)
+        Err(FswError::TablePtrEncodeError)
     }
 }
 
@@ -129,7 +180,7 @@ fn enc_rel_leaf_ptr(v: u64) -> Result<Vec<u8>> {
         let b2 = ((v >> 8) & 0xff) as u8;
         Ok(Vec::from([b0, b1, b2]))
     } else {
-        Err(FswError::TableValueEncodeError)
+        Err(FswError::TablePtrEncodeError)
     }
 }
 
@@ -305,8 +356,8 @@ fn build_recurse(
     let right = &arr[split + 1..];
     let own_key = arr[split].0;
     let own_value = arr[split].1;
-//    println!("build_recurse: {} entries, split {} left len {} right len {} mid key {}",
-//       arr.len(), split, left.len(), right.len(), own_key);
+    trace!("build_recurse: {} entries, split {} left len {} right len {} mid key {}",
+       arr.len(), split, left.len(), right.len(), own_key);
 
     assert!(left.len() >= 3);
     let left_is_leaf = left.len() == 3;
@@ -318,7 +369,7 @@ fn build_recurse(
     // left subtree
     let left_ptr = build_recurse(ctx, left, own_key, false)?;
     // right subtree
-    let right_ptr = build_recurse(ctx, right, own_key, unmarked_leaf)?;
+    build_recurse(ctx, right, own_key, unmarked_leaf)?;
 
     // own value
     let n = push(&mut ctx.buf, enc_val(own_value)?)?;
@@ -518,7 +569,7 @@ mod tests {
         arr.push((1205, 10));
         arr.push((1206, 11));
         arr.push((1208, 12));
-        let table = build(&arr).unwrap();
+        let (table, _) = build(&arr, 1000).unwrap();
         assert!(!table.is_empty());
         println!("Built table: {:?}", table);
         for (i, v) in table.iter().enumerate() {
@@ -533,7 +584,7 @@ mod tests {
     fn large_test() {
         for n in 1..10000 {
             let arr = build_test_table(n, n as usize);
-            let table = build(&arr).unwrap();
+            let (table, _) = build(&arr, n as usize * 20).unwrap();
             println!("Built large table, size {}", table.len());
             let mut output = Vec::new();
             traverse_tree_recurse(&table, &mut output, 0, 0, false).unwrap();
@@ -577,20 +628,13 @@ mod tests {
         for table_size in 1..10000 {
             println!("testing table size {}", table_size);
             let arr = build_test_table(table_size, table_size as usize);
-            let table = build(&arr).unwrap();
+            let (table, _) = build(&arr, table_size as usize * 20).unwrap();
             let mut output = Vec::new();
             traverse_tree_recurse(&table, &mut output, 0, 0, false).unwrap();
             assert_eq!(arr, output);
-            /*
-            for (key, value) in arr.iter() {
-                println!("Table entry: key {} value {}", key, value);
-            }
-            */
             for (key, value) in arr.iter() {
                 // exact match
-                //println!("Finding key {} value {}", key, value);
                 let res = find_key_upper_bound(&table, *key).unwrap();
-                //println!("  found {:?}", res);
                 assert!(res.is_some());
                 let (found_key, found_value) = res.unwrap();
                 assert_eq!(*key, found_key);
