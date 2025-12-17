@@ -106,7 +106,7 @@ pub(crate) fn build(arr: &[(u64, u64)], max_size: usize) -> Result<(Vec<u8>, usi
 // RelKey:
 //   00-DE: 1 byte, val + 111
 //   DF   : followed by 8 bytes i64 (little-endian)
-//   E0-FF: lower 5 bits, followed by 2 bytes (little-endian)
+//   E0-FF: lower 5 bits, followed by 1 byte (little-endian)
 //
 // a ptr with value 0 is used to mark a leaf that is pointed to by a non-leaf ptr
 //   This can happen only for the last right child
@@ -131,7 +131,6 @@ fn enc_rel_key(v: i64) -> Result<Vec<u8>> {
     }
 }
 
-#[cfg(test)]
 fn dec_rel_key(b: &[u8]) -> Result<(i64, usize)> {
     if b.len() < 1 {
         return Err(FswError::TableValueDecodeError);
@@ -188,7 +187,6 @@ fn enc_leaf_marker() -> Result<Vec<u8>> {
     Ok(Vec::from([0x00]))
 }
 
-#[cfg(test)]
 fn is_leaf_marker(b: &[u8]) -> Result<bool> {
     if b.len() < 1 {
         return Err(FswError::TableValueDecodeError);
@@ -196,7 +194,6 @@ fn is_leaf_marker(b: &[u8]) -> Result<bool> {
     Ok(b[0] == 0x00)
 }
 
-#[cfg(test)]
 fn dec_rel_ptr(b: &[u8]) -> Result<(u64, bool, usize)> {
     if b.len() < 1 {
         return Err(FswError::TableValueDecodeError);
@@ -233,7 +230,6 @@ fn enc_val(v: u64) -> Result<Vec<u8>> {
     }
 }
 
-#[allow(dead_code)]
 fn dec_val(b: &[u8]) -> Result<(u64, usize)> {
     if b.len() < 1 {
         return Err(FswError::TableValueDecodeError);
@@ -392,149 +388,153 @@ fn build_recurse(
     Ok(ctx.buf.len() as u64)
 }
 
+#[allow(dead_code)]
+pub fn traverse_tree_recurse(table: &Vec<u8>, output: &mut Vec<(u64, u64)>, mut offset: usize,
+    parent_key: i64, mut is_leaf: bool)
+    -> Result<()>
+{
+    let (mut own_key, advance) = dec_rel_key(&table[offset..])?;
+    own_key += parent_key;
+    offset += advance;
+
+    if !is_leaf {
+        if is_leaf_marker(&table[offset..])? {
+            offset += 1;
+            is_leaf = true;
+        }
+    }
+
+    if is_leaf {
+        let (left_key, advance) = dec_rel_key(&table[offset..])?;
+        offset += advance;
+        let (left_value, advance) = dec_val(&table[offset..])?;
+        offset += advance;
+        if left_key != 0 {
+            output.push(((own_key + left_key) as u64, left_value));
+        }
+        // own value
+        let (own_value, advance) = dec_val(&table[offset..])?;
+        offset += advance;
+        if own_key != parent_key {
+            output.push((own_key as u64, own_value));
+        }
+        // right key/value
+        let (right_key, advance) = dec_rel_key(&table[offset..])?;
+        offset += advance;
+        let (right_value, _) = dec_val(&table[offset..])?;
+        if right_key != 0 {
+            output.push(((own_key + right_key) as u64, right_value));
+        }
+
+        return Ok(());
+    }
+
+    // intermediate node
+    // left ptr
+    let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
+    offset += advance;
+
+    // descend into left child
+    traverse_tree_recurse(&table, output, offset + left_ptr as usize, own_key, left_is_leaf)?;
+
+    let (own_value, advance) = dec_val(&table[offset..])?;
+    offset += advance;
+
+    output.push((own_key as u64, own_value));
+
+    // descend into right child
+    traverse_tree_recurse(&table, output, offset, own_key, left_is_leaf)?;
+
+    Ok(())
+}
+
+// find the entry with the largest key with key <= given key
+// returns None if given key is smaller than the lowest key in the table
+#[allow(dead_code)]
+pub fn find_key_upper_bound(table: &[u8], search_key: u64) -> Result<Option<(u64, u64)>> {
+    // outline:
+    // start at root
+    // at each node, decode own key
+    //   if given key < own key, go to left child
+    //   else go to right child, recording own key as current best
+    let mut offset = 0;
+    let mut parent_key = 0i64;
+    let mut best = None;
+    let mut is_leaf = false;
+
+    loop {
+        let (mut current_key, advance) = dec_rel_key(&table[offset..])?;
+        offset += advance;
+println!("current_key: {:x}, parent_key: {:x}, offset: {}", current_key, parent_key, offset);
+        if current_key == 0 {
+            // dummy entry
+            return Ok(best);
+        }
+        current_key += parent_key;
+
+        if !is_leaf && is_leaf_marker(&table[offset..])? {
+            offset += 1;
+            is_leaf = true;
+        };
+
+        // intermediate node case
+        if !is_leaf {
+            let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
+            offset += advance;
+
+            parent_key = current_key;
+
+            if search_key < current_key as u64 {
+println!("going left: search_key {:x} < current_key {:x}", search_key, current_key);
+                // go to left child
+                offset += left_ptr as usize;
+            } else {
+println!("going right: search_key {:x} >= current_key {:x}", search_key, current_key);
+                let (current_val, advance) = dec_val(&table[offset..])?;
+                offset += advance;
+                best = Some((current_key as u64, current_val));
+                // continue with right child
+            }
+
+            is_leaf = left_is_leaf;
+            continue;
+        }
+
+        // leaf node case
+        let (left_key, advance) = dec_rel_key(&table[offset..])?;
+        offset += advance;
+        let (left_value, advance) = dec_val(&table[offset..])?;
+        offset += advance;
+
+        // own value
+        let (own_value, advance) = dec_val(&table[offset..])?;
+        offset += advance;
+
+        if search_key < current_key as u64 {
+            if left_key != 0 && search_key >= (left_key + current_key) as u64 {
+                    return Ok(Some(((left_key + current_key) as u64, left_value)));
+            }
+            return Ok(best);
+        }
+
+        // right key/value
+        let (right_key, advance) = dec_rel_key(&table[offset..])?;
+        offset += advance;
+        let (right_value, _) = dec_val(&table[offset..])?;
+
+        if right_key != 0 && search_key >= (right_key + current_key) as u64 {
+            return Ok(Some(((right_key + current_key) as u64, right_value)));
+        }
+
+        return Ok(Some((current_key as u64, own_value)));
+    }
+}
 // tests
 #[cfg(test)]
 mod tests {
     use rand::prelude::*;
     use super::*;
     use crate::Result;
-
-    fn traverse_tree_recurse(table: &Vec<u8>, output: &mut Vec<(u64, u64)>, mut offset: usize,
-        parent_key: i64, mut is_leaf: bool)
-        -> Result<()>
-    {
-        let (mut own_key, advance) = dec_rel_key(&table[offset..])?;
-        own_key += parent_key;
-        offset += advance;
-
-        if !is_leaf {
-            if is_leaf_marker(&table[offset..])? {
-                offset += 1;
-                is_leaf = true;
-            }
-        }
-
-        if is_leaf {
-            let (left_key, advance) = dec_rel_key(&table[offset..])?;
-            offset += advance;
-            let (left_value, advance) = dec_val(&table[offset..])?;
-            offset += advance;
-            if left_key != 0 {
-                output.push(((own_key + left_key) as u64, left_value));
-            }
-            // own value
-            let (own_value, advance) = dec_val(&table[offset..])?;
-            offset += advance;
-            if own_key != parent_key {
-                output.push((own_key as u64, own_value));
-            }
-            // right key/value
-            let (right_key, advance) = dec_rel_key(&table[offset..])?;
-            offset += advance;
-            let (right_value, _) = dec_val(&table[offset..])?;
-            if right_key != 0 {
-                output.push(((own_key + right_key) as u64, right_value));
-            }
-
-            return Ok(());
-        }
-
-        // intermediate node
-        // left ptr
-        let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
-        offset += advance;
-
-        // descend into left child
-        traverse_tree_recurse(&table, output, offset + left_ptr as usize, own_key, left_is_leaf)?;
-
-        let (own_value, advance) = dec_val(&table[offset..])?;
-        offset += advance;
-
-        output.push((own_key as u64, own_value));
-
-        // descend into right child
-        traverse_tree_recurse(&table, output, offset, own_key, left_is_leaf)?;
-
-        Ok(())
-    }
-
-    // find the entry with the largest key with key <= given key
-    // returns None if given key is smaller than the lowest key in the table
-    fn find_key_upper_bound(table: &[u8], search_key: u64) -> Result<Option<(u64, u64)>> {
-        // outline:
-        // start at root
-        // at each node, decode own key
-        //   if given key < own key, go to left child
-        //   else go to right child, recording own key as current best
-        let mut offset = 0;
-        let mut parent_key = 0i64;
-        let mut best = None;
-        let mut is_leaf = false;
-
-        loop {
-            let (mut current_key, advance) = dec_rel_key(&table[offset..])?;
-            offset += advance;
-            if current_key == 0 {
-                // dummy entry
-                return Ok(best);
-            }
-            current_key += parent_key;
-
-            if !is_leaf && is_leaf_marker(&table[offset..])? {
-                offset += 1;
-                is_leaf = true;
-            };
-
-            // intermediate node case
-            if !is_leaf {
-                let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
-                offset += advance;
-
-                parent_key = current_key;
-
-                if search_key < current_key as u64 {
-                    // go to left child
-                    offset += left_ptr as usize;
-                } else {
-                    let (current_val, advance) = dec_val(&table[offset..])?;
-                    offset += advance;
-                    best = Some((current_key as u64, current_val));
-                    // continue with right child
-                }
-
-                is_leaf = left_is_leaf;
-                continue;
-            }
-
-            // leaf node case
-            let (left_key, advance) = dec_rel_key(&table[offset..])?;
-            offset += advance;
-            let (left_value, advance) = dec_val(&table[offset..])?;
-            offset += advance;
-
-            // own value
-            let (own_value, advance) = dec_val(&table[offset..])?;
-            offset += advance;
-
-            if search_key < current_key as u64 {
-                if left_key != 0 && search_key >= (left_key + current_key) as u64 {
-                        return Ok(Some(((left_key + current_key) as u64, left_value)));
-                }
-                return Ok(best);
-            }
-
-            // right key/value
-            let (right_key, advance) = dec_rel_key(&table[offset..])?;
-            offset += advance;
-            let (right_value, _) = dec_val(&table[offset..])?;
-
-            if right_key != 0 && search_key >= (right_key + current_key) as u64 {
-                return Ok(Some(((right_key + current_key) as u64, right_value)));
-            }
-
-            return Ok(Some((current_key as u64, own_value)));
-        }
-    }
 
     fn build_test_table(seed: u64, sz: usize) -> Vec<(u64, u64)> {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
