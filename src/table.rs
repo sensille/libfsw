@@ -16,7 +16,7 @@ pub(crate) fn build(arr: &[(u64, u64)], max_size: usize) -> Result<(Vec<u8>, usi
     debug!("Building table with {} entries into {} bytes", arr.len(), max_size);
 
     let mut entries = ((max_size as f64 / 2.6) as usize).min(arr.len());
-    let mut left = 1;
+    let mut left = 0;
     let mut right = arr.len();
     let mut result = None;
 
@@ -465,70 +465,72 @@ pub fn find_key_upper_bound(table: &[u8], search_key: u64) -> Result<Option<(u64
     loop {
         let (mut current_key, advance) = dec_rel_key(&table[offset..])?;
         offset += advance;
-println!("current_key: {:x}, parent_key: {:x}, offset: {}", current_key, parent_key, offset);
+println!("current_key: 0x{:x} ({}), parent_key: {:x}, offset: {}", current_key, current_key, parent_key, offset);
         if current_key == 0 {
             // dummy entry
             return Ok(best);
         }
         current_key += parent_key;
+        parent_key = current_key;
+
+        if is_leaf {
+            break;
+        }
 
         if !is_leaf && is_leaf_marker(&table[offset..])? {
             offset += 1;
-            is_leaf = true;
+            break;
         };
 
         // intermediate node case
-        if !is_leaf {
-            let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
-            offset += advance;
-
-            parent_key = current_key;
-
-            if search_key < current_key as u64 {
-println!("going left: search_key {:x} < current_key {:x}", search_key, current_key);
-                // go to left child
-                offset += left_ptr as usize;
-            } else {
-println!("going right: search_key {:x} >= current_key {:x}", search_key, current_key);
-                let (current_val, advance) = dec_val(&table[offset..])?;
-                offset += advance;
-                best = Some((current_key as u64, current_val));
-                // continue with right child
-            }
-
-            is_leaf = left_is_leaf;
-            continue;
-        }
-
-        // leaf node case
-        let (left_key, advance) = dec_rel_key(&table[offset..])?;
-        offset += advance;
-        let (left_value, advance) = dec_val(&table[offset..])?;
-        offset += advance;
-
-        // own value
-        let (own_value, advance) = dec_val(&table[offset..])?;
+        let (left_ptr, left_is_leaf, advance) = dec_rel_ptr(&table[offset..])?;
         offset += advance;
 
         if search_key < current_key as u64 {
-            if left_key != 0 && search_key >= (left_key + current_key) as u64 {
-                    return Ok(Some(((left_key + current_key) as u64, left_value)));
-            }
-            return Ok(best);
+println!("going left: search_key {:x} < current_key {:x}", search_key, current_key);
+            // go to left child
+            offset += left_ptr as usize;
+        } else {
+println!("going right: search_key {:x} >= current_key {:x}", search_key, current_key);
+            let (current_val, advance) = dec_val(&table[offset..])?;
+            offset += advance;
+            best = Some((current_key as u64, current_val));
+            // continue with right child
         }
 
-        // right key/value
-        let (right_key, advance) = dec_rel_key(&table[offset..])?;
-        offset += advance;
-        let (right_value, _) = dec_val(&table[offset..])?;
-
-        if right_key != 0 && search_key >= (right_key + current_key) as u64 {
-            return Ok(Some(((right_key + current_key) as u64, right_value)));
-        }
-
-        return Ok(Some((current_key as u64, own_value)));
+        is_leaf = left_is_leaf;
+        continue;
     }
+
+    // leaf node case
+    let (left_key, advance) = dec_rel_key(&table[offset..])?;
+    offset += advance;
+    let (left_value, advance) = dec_val(&table[offset..])?;
+    offset += advance;
+
+    // own value
+    let (own_value, advance) = dec_val(&table[offset..])?;
+    offset += advance;
+
+    if search_key < parent_key as u64 {
+        if left_key != 0 && search_key >= (left_key + parent_key) as u64 {
+                return Ok(Some(((left_key + parent_key) as u64, left_value)));
+        }
+        return Ok(best);
+    }
+
+    // right key/value
+    let (right_key, advance) = dec_rel_key(&table[offset..])?;
+    offset += advance;
+    let (right_value, _) = dec_val(&table[offset..])?;
+
+    if right_key != 0 && search_key >= (right_key + parent_key) as u64 {
+        return Ok(Some(((right_key + parent_key) as u64, right_value)));
+    }
+
+    return Ok(Some((parent_key as u64, own_value)));
 }
+
 // tests
 #[cfg(test)]
 mod tests {
@@ -582,6 +584,7 @@ mod tests {
 
     #[test]
     fn large_test() {
+        env_logger::init();
         for n in 1..10000 {
             let arr = build_test_table(n, n as usize);
             let (table, _) = build(&arr, n as usize * 20).unwrap();
@@ -624,6 +627,7 @@ mod tests {
 
     #[test]
     fn test_find_key() {
+        env_logger::init();
         let probes = 10000;
         for table_size in 1..10000 {
             println!("testing table size {}", table_size);

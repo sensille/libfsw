@@ -456,7 +456,7 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
         println!("addr 8dca has entry id {:x?}", e);
         println!("new id for it is {}", entry_id_map[e.1.unwrap()] + 1);
         println!("entry is {:?}", self.unwind_entries.get(&e.1.unwrap()).unwrap());
-        let res = table::find_key_upper_bound(&tables[0], 0x8dca)?;
+        let res = table::find_key_upper_bound(&tables[0], 0x9260)?;
         println!("table lookup gives entry key {:x} id {}", res.unwrap().0, res.unwrap().1);
 
         //exit process
@@ -515,13 +515,4 @@ println!("map: {:x}-{:x} offset {:x} file {}", vm_start, vm_end, offset, file_pa
         });
     }
     Ok(maps)
-}
-
-#[cfg(test)]
-mod tests {
-    //use super::*;
-
-    #[test]
-    fn it_works() {
-    }
 }
