@@ -402,7 +402,7 @@ println!("Adding file: {} result {:?}", map.file_path, res);
 
             let mut start = 0;
             while arr.len() > start {
-                let sz = chunk_size - current_table.len() - 0; // leave some space to relax bounds
+                let sz = chunk_size - current_table.len() - 16; // leave some space to relax bounds
                                                                 // checks in eBPF
                 let (table, entries) = table::build(&arr[start..], sz)?;
 println!("add mapping: oid {} addr {:x} table id {} offset {}",
