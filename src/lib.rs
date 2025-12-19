@@ -1,9 +1,12 @@
 use object::{Object, ObjectSection};
-use gimli::{ UnwindSection, Register };
+use gimli::UnwindSection;
 use thiserror::Error;
-use std::collections::{ HashMap, BTreeMap, BTreeSet };
+use std::collections::{ HashMap, BTreeMap };
 use log::{ debug, info, warn };
 
+const NUM_REGISTERS: usize = 17; // r0 - r15 + pc
+const CFT_ENTRY_SIZE: usize = 228;
+const MAX_MAPPINGS: usize = 1000;
 mod table;
 
 #[derive(Error, Debug)]
@@ -44,61 +47,6 @@ use FswError::*;
 
 type Result<T> = std::result::Result<T, FswError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CfaRule {
-    RegisterAndOffset(u16, i64),
-    Expression(usize),
-}
-
-/*
-impl std::fmt::Debug for CFARule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CFARule::Uninitialized => write!(f, "-"),
-            CFARule::RegOffset(reg, off) => write!(f, "r{}+{}", reg, off),
-            CFARule::Expression(_) => write!(f, "expr"),
-        }
-    }
-}
-*/
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RegisterRule {
-    Undefined,
-    SameValue,
-    Offset(i64),
-    ValOffset(i64),
-    Register(Register),
-    Expression(usize),
-    ValExpression(usize),
-    Architectural,
-    Constant(u64),
-}
-
-/*
-impl std::fmt::Debug for RegisterRule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RegisterRule::Uninitialized => write!(f, "-"),
-            RegisterRule::Undefined => write!(f, "u"),
-            RegisterRule::SameValue => write!(f, "="),
-            RegisterRule::Offset(off) => write!(f, "o{}", off),
-            RegisterRule::ValOffset(off) => write!(f, "vo{}", off),
-            RegisterRule::Register(reg) => write!(f, "r{}", reg),
-            RegisterRule::Expression(_) => write!(f, "expr"),
-            RegisterRule::ValExpression(_) => write!(f, "vexpr"),
-        }
-    }
-}
-*/
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct UnwindEntry {
-    pub cfa: CfaRule,
-    pub rules: Vec<(Register, RegisterRule)>,
-    pub saved_args_size: u64,
-}
-
 /*
 #[derive(Debug)]
 struct EvaluationContext {
@@ -111,10 +59,9 @@ struct EvaluationContext {
 #[derive(Debug)]
 pub struct Fsw {
     unwind_tables: Vec<BTreeMap<u64, Option<usize>>>,
-    unwind_entries: BTreeMap<usize, UnwindEntry>,   // XXX needed? only rev?
+    unwind_entries: BTreeMap<usize, Vec<u8>>,   // XXX needed? only rev?
     unwind_entry_counts: Vec<usize>,
-    unwind_entries_rev: BTreeMap<UnwindEntry, usize>,
-    //maps: BTreeMap<u64, EvaluationContext>, // XXX
+    unwind_entries_rev: BTreeMap<Vec<u8>, usize>,
     expressions: BTreeMap<usize, Vec<u8>>,  // XXX needed? only rev?
     expressions_rev: BTreeMap<Vec<u8>, usize>,
     total_eh_frame_size: usize,
@@ -195,10 +142,18 @@ impl Fsw {
                         .map_err(GimliError)?;
                     let mut error = ParsingError::NoError;
                     'rows: while let Some(row) = table.next_row().map_err(GimliError)? {
-                        // convert CFA
-                        let cfa = match row.cfa() {
+                        let mut s = Vec::new();
+                        // serialize row into the format used by our eBPF program
+                        let saved_args_size = row.saved_args_size() as u64;
+                        s.extend_from_slice(&saved_args_size.to_le_bytes());
+
+                        match row.cfa() {
                             gimli::CfaRule::RegisterAndOffset { register, offset } => {
-                                CfaRule::RegisterAndOffset(register.0, *offset)
+                                let reg = register.0 as u32;
+                                let off = *offset as i64;
+                                s.extend_from_slice(&1u32.to_le_bytes());
+                                s.extend_from_slice(&reg.to_le_bytes());
+                                s.extend_from_slice(&off.to_le_bytes());
                             }
                             gimli::CfaRule::Expression(e) => {
                                 if e.offset + e.length > eh_frame_data.len() {
@@ -206,18 +161,40 @@ impl Fsw {
                                 }
                                 let expr_id = self.add_expression(Vec::from(&eh_frame_data
                                     [e.offset .. e.offset + e.length]));
-                                CfaRule::Expression(expr_id)
+                                let expr_id = expr_id as u32;
+                                s.extend_from_slice(&2u32.to_le_bytes());
+                                s.extend_from_slice(&expr_id.to_le_bytes());
+                                s.extend_from_slice(&[0u8; 8]);
                             }
-                        };
+                        }
                         // convert registers
-                        let mut rules = Vec::new();
+                        let mut rules_s = Vec::new();
                         for (reg, rule) in row.registers() {
-                            let rule = match rule {
-                                gimli::RegisterRule::Undefined => RegisterRule::Undefined,
-                                gimli::RegisterRule::SameValue => RegisterRule::SameValue,
-                                gimli::RegisterRule::Offset(o) => RegisterRule::Offset(*o),
-                                gimli::RegisterRule::ValOffset(o) => RegisterRule::ValOffset(*o),
-                                gimli::RegisterRule::Register(r) => RegisterRule::Register(*r),
+                            let mut rs = Vec::new();
+                            match rule {
+                                gimli::RegisterRule::Undefined => {
+                                    rs.extend_from_slice(&1u32.to_le_bytes());
+                                    rs.extend_from_slice(&[0u8; 8]);
+                                }
+                                gimli::RegisterRule::SameValue => {
+                                    rs.extend_from_slice(&2u32.to_le_bytes());
+                                    rs.extend_from_slice(&[0u8; 8]);
+                                }
+                                gimli::RegisterRule::Offset(o) => {
+                                    let off = *o as i64;
+                                    rs.extend_from_slice(&3u32.to_le_bytes());
+                                    rs.extend_from_slice(&off.to_le_bytes());
+                                }
+                                gimli::RegisterRule::ValOffset(o) => {
+                                    let off = *o as i64;
+                                    rs.extend_from_slice(&4u32.to_le_bytes());
+                                    rs.extend_from_slice(&off.to_le_bytes());
+                                }
+                                gimli::RegisterRule::Register(r) => {
+                                    let reg = r.0 as u64;
+                                    rs.extend_from_slice(&5u32.to_le_bytes());
+                                    rs.extend_from_slice(&reg.to_le_bytes());
+                                },
                                 gimli::RegisterRule::Expression(e) => {
                                     if e.offset + e.length > eh_frame_data.len() {
                                         error = ParsingError::BadExpressionOffset;
@@ -225,7 +202,9 @@ impl Fsw {
                                     }
                                     let expr_id = self.add_expression(Vec::from(&eh_frame_data
                                         [e.offset .. e.offset + e.length]));
-                                    RegisterRule::Expression(expr_id)
+                                        let expr_id = expr_id as u64;
+                                        rs.extend_from_slice(&6u32.to_le_bytes());
+                                        rs.extend_from_slice(&expr_id.to_le_bytes());
                                 }
                                 gimli::RegisterRule::ValExpression(e) => {
                                     if e.offset + e.length > eh_frame_data.len() {
@@ -234,31 +213,45 @@ impl Fsw {
                                     }
                                     let expr_id = self.add_expression(Vec::from(&eh_frame_data
                                         [e.offset .. e.offset + e.length]));
-                                    RegisterRule::ValExpression(expr_id)
+                                    rs.extend_from_slice(&7u32.to_le_bytes());
+                                    rs.extend_from_slice(&expr_id.to_le_bytes());
                                 }
-                                gimli::RegisterRule::Architectural => RegisterRule::Architectural,
-                                gimli::RegisterRule::Constant(c) => RegisterRule::Constant(*c),
+                                gimli::RegisterRule::Architectural => {
+                                    rs.extend_from_slice(&8u32.to_le_bytes());
+                                    rs.extend_from_slice(&[0u8; 8]);
+                                }
+                                gimli::RegisterRule::Constant(c) => {
+                                    let c = *c as u64;
+                                    rs.extend_from_slice(&9u32.to_le_bytes());
+                                    rs.extend_from_slice(&c.to_le_bytes());
+                                }
                                 _ => {
                                     error = ParsingError::UnknownRegisterRule;
                                     break 'rows;
                                 }
                             };
-                            rules.push((reg.clone(), rule));
+                            rules_s.push((reg.0, rs));
                         }
 
-                        let entry = UnwindEntry {
-                            cfa,
-                            rules,
-                            saved_args_size: row.saved_args_size(),
-                        };
+                        for i in 0 .. NUM_REGISTERS as u16 {
+                            if let Some((_, rule)) = rules_s.iter().find(|(r, _)| *r == i) {
+                                s.extend_from_slice(rule);
+                            } else {
+                                // uninitialized
+                                s.extend_from_slice(&0u32.to_le_bytes());
+                                s.extend_from_slice(&[0u8; 8]);
+                            }
+                        }
+                        assert_eq!(s.len(), CFT_ENTRY_SIZE);
+
                         // get row index or create new
-                        let entryid = if let Some(id) = self.unwind_entries_rev.get(&entry) {
+                        let entryid = if let Some(id) = self.unwind_entries_rev.get(&s) {
                             self.unwind_entry_counts[*id] += 1;
                             *id
                         } else {
                             let id = self.unwind_entries.len();
-                            self.unwind_entries.insert(id, entry.clone());
-                            self.unwind_entries_rev.insert(entry, id);
+                            self.unwind_entries.insert(id, s.clone());
+                            self.unwind_entries_rev.insert(s, id);
                             self.unwind_entry_counts.push(1);
                             id
                         };
@@ -294,12 +287,13 @@ impl Fsw {
 
     // returns vec of (vma_start, file-offset, offsetmap_id, start-in-map)
     pub fn build_mapping_for_pid(&mut self, pid: u32)
-        -> Result<Vec<(u64, u64, usize, usize)>>
+        -> Result<Vec<u8>>
     {
         let Some(maps) = self.pid_map.get(&pid) else {
             return Err(FswError::PidNotFound);
         };
-        let mut res = Vec::new();
+        let mut s = vec![0u8; 8]; // reserve space for number of entries
+        let mut num_entries = 0;
         for map in maps.iter() {
             let Some(Some(oid)) = self.files_seen.get(&map.file_path) else {
                 continue;
@@ -317,16 +311,27 @@ impl Fsw {
                     continue;
                 }
                 let delta = *file_offset - map.offset;
-                res.push((
-                    map.vm_start + delta,
-                    map.offset + delta,
-                    *table_id,
-                    *table_offset,
-                ));
+
+                let start = (map.vm_start + delta) as u64;
+                let offset = (map.offset + delta) as u64;
+                let table_id = *table_id as u32;
+                let table_offset = *table_offset as u32;
+
+                s.extend_from_slice(&start.to_le_bytes());
+                s.extend_from_slice(&offset.to_le_bytes());
+                s.extend_from_slice(&table_id.to_le_bytes());
+                s.extend_from_slice(&table_offset.to_le_bytes());
+
+                num_entries += 1;
             }
         }
+        // prepend number of entries
+        let num_entries_u64 = num_entries as u64;
+        s[0..8].copy_from_slice(&num_entries_u64.to_le_bytes());
+        // fill up to expected size
+        s.extend(vec![0u8; (MAX_MAPPINGS - num_entries) * 24]);
 
-        Ok(res)
+        Ok(s)
     }
 
     pub fn add_pid(&mut self, pid: u32) -> Result<()> {
@@ -365,9 +370,9 @@ println!("Adding file: {} result {:?}", map.file_path, res);
 
     pub fn build_tables(&mut self)
         -> Result<(
-             Vec<Vec<u8>>,                        // unwind tables
-             Vec<UnwindEntry>,                    // unwind entries
-             Vec<Vec<u8>>,                        // expressions
+             Vec<Vec<u8>>,       // unwind tables
+             Vec<Vec<u8>>,       // unwind entries
+             Vec<Vec<u8>>,       // expressions
            )>
     {
         let mut tables = Vec::new();
@@ -424,6 +429,7 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
         }
 
         if !current_table.is_empty() {
+            current_table.extend(vec![0u8; chunk_size - current_table.len()]); // pad end
             tables.push(current_table);
         }
         println!("Final unwind table size: {} in {} parts",
@@ -435,38 +441,21 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
         println!("Unique unwind entries: {}", self.unwind_entries.len());
 
         let mut entries = Vec::new();
-        entries.push(UnwindEntry {
-            cfa: CfaRule::RegisterAndOffset(0, 0),
-            rules: Vec::new(),
-            saved_args_size: 0,
-        }); // entry id 0 means no unwind info
+        entries.push(vec![0u8; CFT_ENTRY_SIZE]); // entry id 0 means no unwind info
         for (old_id, _) in by_count.iter() {
             let entry = self.unwind_entries.get(old_id).unwrap();
             entries.push(entry.clone());
         }
-        println!("cft 117 is {:?}", entries[117]);
-        for (i, e) in entry_id_map.iter().enumerate() {
-            if *e == 117 - 1 {
-                println!("old entry id {} is new entry id 117", i);
-                println!("entry is {:?}", self.unwind_entries.get(&i).unwrap());
-            }
-        }
-        // get entry id for addr 8dca
-        let e = self.unwind_tables[0].range(..&0x8dca).rev().next().unwrap();
-        println!("addr 8dca has entry id {:x?}", e);
-        println!("new id for it is {}", entry_id_map[e.1.unwrap()] + 1);
-        println!("entry is {:?}", self.unwind_entries.get(&e.1.unwrap()).unwrap());
-        let res = table::find_key_upper_bound(&tables[0], 0x9260)?;
-        println!("table lookup gives entry key {:x} id {}", res.unwrap().0, res.unwrap().1);
-
-        //exit process
-        //std::process::exit(0);
 
         // XXX TODO: build as vector in the first place
         let mut exprs = Vec::new();
         for (id, expr) in self.expressions.iter() {
             assert_eq!(*id, exprs.len());
-            exprs.push(expr.clone());
+            assert!(expr.len() < 256);
+            let mut e = expr.clone();
+            e.extend_from_slice(&[e.len() as u8; 1]);
+            e.extend(vec![0u8; 255 - expr.len()]); // align to 16 bytes
+            exprs.push(e);
         }
 
         self.table_mappings = mappings;
