@@ -101,8 +101,9 @@ pub(crate) fn build(arr: &[(u64, u64)], max_size: usize) -> Result<(Vec<u8>, usi
 //   D8-DF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
 //   E0-FF: ptr as 1 byte
 // values:
-//   00-F7: encode as 1 byte
-//   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//   00-F6: encode as 1 byte
+//   F8-FF: first byte with 3 lower bits of value, followed by 1 byte
+//   F7   : followed by 3 bytes u64 (little-endian)
 // RelKey:
 //   00-DE: 1 byte, val + 111
 //   DF   : followed by 8 bytes i64 (little-endian)
@@ -218,13 +219,18 @@ fn dec_rel_ptr(b: &[u8]) -> Result<(u64, bool, usize)> {
 }
 
 fn enc_val(v: u64) -> Result<Vec<u8>> {
-    if v <= 0xef {
+    if v <= 0xf6 {
         Ok(Vec::from([v as u8]))
-    } else if v <= 0x3ffff {
-        let b0 = 0xf0 | (((v >> 16) as u8) & 0x07);
+    } else if v <= 0x3ff {
+        let b0 = 0xf8 | (((v >> 8) as u8) & 0x07);
         let b1 = (v & 0xff) as u8;
-        let b2 = ((v >> 8) & 0xff) as u8;
-        Ok(Vec::from([b0, b1, b2]))
+        Ok(Vec::from([b0, b1]))
+    } else if v <= 0xffffff {
+        let b0 = 0xf7;
+        let b1 = (v >> 16) as u8;
+        let b2 = (v >> 8) as u8;
+        let b3 = (v & 0xff) as u8;
+        Ok(Vec::from([b0, b1, b2, b3]))
     } else {
         Err(FswError::TableValueEncodeError)
     }
@@ -234,14 +240,20 @@ fn dec_val(b: &[u8]) -> Result<(u64, usize)> {
     if b.len() < 1 {
         return Err(FswError::TableValueDecodeError);
     }
-    if b[0] <= 0xef {
+    if b[0] <= 0xf6 {
         Ok((b[0] as u64, 1))
-    } else {
-        if b.len() < 3 {
+    } else if b[0] == 0xf7 {
+        if b.len() < 4 {
             return Err(FswError::TableValueDecodeError);
         }
-        let val = (((b[0] as u64 & 0x07) << 16) | ((b[2] as u64) << 8) | (b[1] as u64)) as u64;
-        Ok((val, 3))
+        let val = ((b[1] as u64) << 16) | ((b[2] as u64) << 8) | (b[3] as u64);
+        Ok((val, 4))
+    } else {
+        if b.len() < 2 {
+            return Err(FswError::TableValueDecodeError);
+        }
+        let val = ((b[0] as u64 & 0x07) << 8) | (b[1] as u64);
+        Ok((val, 2))
     }
 }
 
@@ -465,7 +477,6 @@ pub fn find_key_upper_bound(table: &[u8], search_key: u64) -> Result<Option<(u64
     loop {
         let (mut current_key, advance) = dec_rel_key(&table[offset..])?;
         offset += advance;
-println!("current_key: 0x{:x} ({}), parent_key: {:x}, offset: {}", current_key, current_key, parent_key, offset);
         if current_key == 0 {
             // dummy entry
             return Ok(best);
@@ -487,11 +498,9 @@ println!("current_key: 0x{:x} ({}), parent_key: {:x}, offset: {}", current_key, 
         offset += advance;
 
         if search_key < current_key as u64 {
-println!("going left: search_key {:x} < current_key {:x}", search_key, current_key);
             // go to left child
             offset += left_ptr as usize;
         } else {
-println!("going right: search_key {:x} >= current_key {:x}", search_key, current_key);
             let (current_val, advance) = dec_val(&table[offset..])?;
             offset += advance;
             best = Some((current_key as u64, current_val));
@@ -687,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_val_encoding() {
-        for v in 0..262144 {
+        for v in 0..500000 {
             let enc = enc_val(v).unwrap();
             let (dec, _) = dec_val(&enc).unwrap();
             assert_eq!(v, dec);

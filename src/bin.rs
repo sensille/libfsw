@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     return Ok(());
     fsw.add_file("/usr/lib/libz.so.1.3.1")?;
     */
-    fsw.add_pid(3694)?;
+    fsw.add_pid(3905)?;
     fsw.build_tables()?;
 
     Ok(())
