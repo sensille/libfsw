@@ -11,8 +11,12 @@ fn main() -> Result<()> {
     return Ok(());
     fsw.add_file("/usr/lib/libz.so.1.3.1")?;
     */
-    fsw.add_pid(3905)?;
+    let pid = 4504;
+    fsw.add_file("/usr/lib/firefox/libxul.so")?;
+    //fsw.add_pid(pid)?;
     fsw.build_tables()?;
+    let res = fsw.lookup(pid, 0x7cd5da39a1cb);
+    println!("{:?}", res);
 
     Ok(())
 }

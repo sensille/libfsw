@@ -41,6 +41,8 @@ pub enum FswError {
     TableNotBuilt,
     #[error("PID not found")]
     PidNotFound,
+    #[error("Unexpected object type, expected ELF")]
+    UnexpectedObjectType,
 
 }
 use FswError::*;
@@ -97,7 +99,7 @@ impl Fsw {
     // oid object id must be unique
     pub fn add_file<P: AsRef<std::path::Path>>(&mut self, path: P)
         -> Result<(usize, HashMap<ParsingError, u64>)>
-    { 
+    {
         let oid = self.unwind_tables.len();
         if oid == u16::MAX as usize {
             return Err(TooManyObjects);
@@ -106,6 +108,27 @@ impl Fsw {
 
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(MmapError)? };
         let object = object::File::parse(&*mmap).map_err(ObjectParseError)?;
+
+        /*
+         * enumerate all sections and store the offset between VMA and file offset
+         */
+        let mut map_offsets: BTreeMap<u64, i64> = BTreeMap::new();
+        for section in object.sections() {
+            let object::SectionFlags::Elf{ sh_flags: flags} = section.flags() else {
+                return Err(UnexpectedObjectType);
+            };
+            if (flags as u32 & object::elf::SHF_ALLOC) == 0 {
+                continue;
+            }
+            let addr = section.address();
+            let Some((offset, _)) = section.file_range() else {
+                continue;
+            };
+            if addr == offset {
+                continue;
+            }
+            map_offsets.insert(addr, addr as i64 - offset as i64);
+        }
 
         let eh_frame_section = object
             .section_by_name(".eh_frame")
@@ -141,6 +164,10 @@ impl Fsw {
                     let mut table = fde.rows(&eh_frame, &bases, &mut unwind_ctx)
                         .map_err(GimliError)?;
                     let mut error = ParsingError::NoError;
+                    let map_offset = map_offsets.range(..=fde.initial_address())
+                        .next_back()
+                        .map(|(_, o)| *o)
+                        .unwrap_or(0);
                     'rows: while let Some(row) = table.next_row().map_err(GimliError)? {
                         let mut s = Vec::new();
                         // serialize row into the format used by our eBPF program
@@ -255,11 +282,12 @@ impl Fsw {
                             self.unwind_entry_counts.push(1);
                             id
                         };
+                        // VMAs are much smaller than 64 bits
+                        let start = (row.start_address() as i64 - map_offset) as u64;
+                        let end = (row.end_address() as i64 - map_offset) as u64;
                         // start may override end
                         // start may not override start
                         // end overrides nothing
-                        let start = row.start_address();
-                        let end = row.end_address();
                         if let Some(Some(_)) = unwind_table.get(&start) {
                             error = ParsingError::RowOverlap;
                             break 'rows;
@@ -383,7 +411,7 @@ println!("Adding file: {} result {:?}", map.file_path, res);
         // the entries with the highest occurences get the lowest ids for a smaller encoding
         let mut by_count: Vec<(usize, usize)> = self.unwind_entry_counts.iter().enumerate()
             .map(|(i, c)| (i, *c)).collect();
-        by_count.sort_by(|a, b| b.1.cmp(&a.1));
+        //by_count.sort_by(|a, b| b.1.cmp(&a.1));
 
         // build map from old entry id to new entry id
         let mut entry_id_map = vec![0; by_count.len()];
@@ -461,6 +489,45 @@ println!("add mapping: oid {} addr {:x} table id {} offset {}",
         self.table_mappings = mappings;
 
         Ok((tables, entries, exprs))
+    }
+
+    pub fn lookup(&self, pid: u32, addr: u64) -> Option<(usize, usize)> {
+        let Some(maps) = self.pid_map.get(&pid) else {
+            return None;
+        };
+        let mut by_count: Vec<(usize, usize)> = self.unwind_entry_counts.iter().enumerate()
+            .map(|(i, c)| (i, *c)).collect();
+        //by_count.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // build map from old entry id to new entry id
+        let mut entry_id_map = vec![0; by_count.len()];
+        for (new_id, (old_id, _count)) in by_count.iter().enumerate() {
+            entry_id_map[*old_id] = new_id;
+        }
+
+        for map in maps.iter() {
+            if addr >= map.vm_start && addr < map.vm_end {
+                let Some(Some(oid)) = self.files_seen.get(&map.file_path) else {
+                    return None;
+                };
+                let unwind_table = &self.unwind_tables[*oid];
+                let offset = addr - map.vm_start + map.offset;
+                let entry = unwind_table.range(..=offset).next_back();
+                println!("Unwind table entry for addr {:x} off {:x}: {:x?}", addr, offset, entry);
+                let Some((_, entry_opt)) = entry else {
+                    println!("No unwind info for addr {:x}", addr);
+                    return None;
+                };
+                let entry_id = match entry_opt {
+                    Some(eid) => entry_id_map[*eid] + 1, // entry ids start at 1
+                    None => 0,                           // 0 means end of unwind info
+                };
+                println!("Found unwind entry id {} for addr {:x}", entry_id, addr);
+                let rules = self.unwind_entries.get(&entry_id)?;
+                println!("Unwind rules: {:x?}", rules);
+            }
+        }
+        None
     }
 }
 
